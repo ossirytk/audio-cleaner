@@ -193,6 +193,16 @@ def test_loudness_detector_too_short() -> None:
     assert det.detect(audio, SAMPLE_RATE) == []
 
 
+def test_loudness_detector_too_long() -> None:
+    """A loud burst longer than max_duration_s should not be returned."""
+    quiet = _sine(440, 10.0, amp=0.01)
+    loud = _sine(440, 130.0, amp=0.9)  # 130 s > max_duration_s=120.0
+    quiet2 = _sine(440, 10.0, amp=0.01)
+    audio = _concat(quiet, loud, quiet2)
+    det = LoudnessChangeDetector(loudness_jump_db=8.0, min_duration_s=5.0, max_duration_s=120.0)
+    assert det.detect(audio, SAMPLE_RATE) == []
+
+
 # ---------------------------------------------------------------------------
 # SpectralDissimilarityDetector
 # ---------------------------------------------------------------------------
@@ -281,6 +291,25 @@ def test_remove_ads_no_ads() -> None:
     audio = _sine(440, 3.0, amp=0.3)
     out = remove_ads(audio, SAMPLE_RATE, strategy="silence")
     np.testing.assert_array_equal(out, audio)
+
+
+def test_remove_ads_spectral_strategy() -> None:
+    """remove_ads with spectral strategy should remove a spectrally dissimilar burst."""
+    rng = np.random.default_rng(42)
+    baseline = _sine(440, 10.0, amp=0.3)
+    burst = rng.standard_normal(10 * SAMPLE_RATE).astype(np.float32) * 0.3
+    tail = _sine(440, 10.0, amp=0.3)
+    audio = _concat(baseline, burst, tail)
+    out = remove_ads(
+        audio,
+        SAMPLE_RATE,
+        strategy="spectral",
+        spectral_distance_threshold=0.05,
+        spectral_baseline_windows=5,
+        spectral_min_duration_s=3.0,
+        spectral_max_duration_s=30.0,
+    )
+    assert len(out) < len(audio)
 
 
 def test_remove_ads_stereo_silence() -> None:

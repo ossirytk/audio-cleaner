@@ -318,12 +318,28 @@ class SpectralDissimilarityDetector:
         if n_windows < self.baseline_windows + 1:
             return []
 
-        # Compute mean MFCC vector for each window
+        # Compute MFCCs once for the entire signal, then aggregate per window
+        hop_length = 512
+        mfcc_full = librosa.feature.mfcc(
+            y=mono,
+            sr=sample_rate,
+            n_mfcc=self.n_mfcc,
+            hop_length=hop_length,
+        )
+        # Number of MFCC frames that approximately span one analysis window
+        frames_per_window = max(1, win_len // hop_length)
+        max_mfcc_windows = mfcc_full.shape[1] // frames_per_window
+        n_windows = min(n_windows, max_mfcc_windows)
+
+        if n_windows < self.baseline_windows + 1:
+            return []
+
+        # Compute mean MFCC vector for each window by averaging frames in that window
         mfcc_vectors: list[npt.NDArray[np.float64]] = []
         for i in range(n_windows):
-            frame = mono[i * win_len : (i + 1) * win_len]
-            mfcc = librosa.feature.mfcc(y=frame, sr=sample_rate, n_mfcc=self.n_mfcc)
-            mfcc_vectors.append(mfcc.mean(axis=1))
+            start_frame = i * frames_per_window
+            end_frame = start_frame + frames_per_window
+            mfcc_vectors.append(mfcc_full[:, start_frame:end_frame].mean(axis=1))
 
         # Baseline: mean of first N windows
         baseline = np.mean(mfcc_vectors[: self.baseline_windows], axis=0)
@@ -335,7 +351,13 @@ class SpectralDissimilarityDetector:
         candidate_flags = np.zeros(n_windows, dtype=bool)
         for i in range(self.baseline_windows, n_windows):
             dist = cosine_distance(mfcc_vectors[i], baseline)
-            candidate_flags[i] = dist > self.distance_threshold
+            # NaN arises when a vector has zero norm (e.g., completely silent window).
+            # A zero-norm MFCC vector is degenerate and indicates unusual audio content,
+            # so we conservatively flag it rather than silently skip it.
+            if np.isnan(dist):
+                candidate_flags[i] = True
+            else:
+                candidate_flags[i] = dist > self.distance_threshold
 
         # Group consecutive flagged windows into segments
         segments: list[Segment] = []
@@ -495,6 +517,42 @@ def remove_ads(
         cleaned = remove_ads(audio, sr, strategy="silence")
         sf.write("podcast_cleaned.flac", cleaned, sr)
     """
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    if audio.ndim not in (1, 2):
+        raise ValueError(
+            f"audio must be 1-D (mono) or 2-D (samples x channels), got ndim={audio.ndim}"
+        )
+    if audio.shape[0] == 0:
+        raise ValueError("audio must not be empty")
+    if fade_ms < 0:
+        raise ValueError(f"fade_ms must be >= 0, got {fade_ms}")
+    if silence_min_duration_s < 0:
+        raise ValueError(f"silence_min_duration_s must be >= 0, got {silence_min_duration_s}")
+    if silence_max_duration_s < silence_min_duration_s:
+        raise ValueError(
+            f"silence_max_duration_s ({silence_max_duration_s}) must be >= "
+            f"silence_min_duration_s ({silence_min_duration_s})"
+        )
+    if loudness_min_duration_s < 0:
+        raise ValueError(f"loudness_min_duration_s must be >= 0, got {loudness_min_duration_s}")
+    if loudness_max_duration_s < loudness_min_duration_s:
+        raise ValueError(
+            f"loudness_max_duration_s ({loudness_max_duration_s}) must be >= "
+            f"loudness_min_duration_s ({loudness_min_duration_s})"
+        )
+    if spectral_min_duration_s < 0:
+        raise ValueError(f"spectral_min_duration_s must be >= 0, got {spectral_min_duration_s}")
+    if spectral_max_duration_s < spectral_min_duration_s:
+        raise ValueError(
+            f"spectral_max_duration_s ({spectral_max_duration_s}) must be >= "
+            f"spectral_min_duration_s ({spectral_min_duration_s})"
+        )
+    if spectral_baseline_windows < 1:
+        raise ValueError(
+            f"spectral_baseline_windows must be >= 1, got {spectral_baseline_windows}"
+        )
+
     cfg = AdRemovalConfig(
         strategy=strategy,
         silence_threshold_db=silence_threshold_db,

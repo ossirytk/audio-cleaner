@@ -30,8 +30,17 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
         audio_files = sorted(
             p for p in input_path.rglob("*") if p.suffix.lower() in {".flac", ".wav"}
         )
+        is_dir_input = True
     elif input_path.is_file():
+        if input_path.suffix.lower() not in {".flac", ".wav"}:
+            print(
+                f"Error: '{input_path}' is not a supported audio file. "
+                "Supported extensions: .flac, .wav.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         audio_files = [input_path]
+        is_dir_input = False
     else:
         print(f"Error: '{input_path}' is not a valid file or directory.", file=sys.stderr)
         sys.exit(1)
@@ -42,26 +51,46 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
 
     strategy: Literal["silence", "loudness", "spectral", "combined"] = args.strategy
 
+    errors: list[str] = []
     for audio_file in audio_files:
         print(f"Processing: {audio_file}")
-        audio, sr = sf.read(str(audio_file), dtype="float32")
-        cleaned = remove_ads(
-            audio,
-            sr,
-            strategy=strategy,
-            silence_threshold_db=args.silence_threshold_db,
-            silence_min_duration_s=args.silence_min_duration_s,
-            silence_max_duration_s=args.silence_max_duration_s,
-            loudness_jump_db=args.loudness_jump_db,
-            loudness_min_duration_s=args.loudness_min_duration_s,
-            loudness_max_duration_s=args.loudness_max_duration_s,
-            spectral_distance_threshold=args.spectral_distance_threshold,
-            fade_ms=args.fade_ms,
-        )
-        out_path = output_dir / audio_file.name
-        sf.write(str(out_path), cleaned, sr)
-        removed_s = (len(audio) - len(cleaned)) / sr
-        print(f"  -> {out_path}  (removed ~{removed_s:.1f} s)")
+        try:
+            audio, sr = sf.read(str(audio_file), dtype="float32")
+            cleaned = remove_ads(
+                audio,
+                sr,
+                strategy=strategy,
+                silence_threshold_db=args.silence_threshold_db,
+                silence_min_duration_s=args.silence_min_duration_s,
+                silence_max_duration_s=args.silence_max_duration_s,
+                loudness_jump_db=args.loudness_jump_db,
+                loudness_min_duration_s=args.loudness_min_duration_s,
+                loudness_max_duration_s=args.loudness_max_duration_s,
+                spectral_distance_threshold=args.spectral_distance_threshold,
+                spectral_baseline_windows=args.spectral_baseline_windows,
+                spectral_min_duration_s=args.spectral_min_duration_s,
+                spectral_max_duration_s=args.spectral_max_duration_s,
+                fade_ms=args.fade_ms,
+            )
+            # Preserve relative directory structure when input is a directory
+            if is_dir_input:
+                out_path = output_dir / audio_file.relative_to(input_path)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                out_path = output_dir / audio_file.name
+            sf.write(str(out_path), cleaned, sr)
+            removed_s = (len(audio) - len(cleaned)) / sr
+            print(f"  -> {out_path}  (removed ~{removed_s:.1f} s)")
+        except Exception as exc:
+            msg = f"  ERROR: {audio_file}: {exc}"
+            print(msg, file=sys.stderr)
+            errors.append(msg)
+
+    if errors:
+        n = len(errors)
+        noun = "file" if n == 1 else "files"
+        print(f"\n{n} {noun} failed to process.", file=sys.stderr)
+        sys.exit(1)
 
 
 def main() -> None:
@@ -152,6 +181,27 @@ def main() -> None:
         default=0.15,
         dest="spectral_distance_threshold",
         help="Cosine distance threshold for spectral detector (default: 0.15).",
+    )
+    ads_parser.add_argument(
+        "--spectral-baseline-windows",
+        type=int,
+        default=10,
+        dest="spectral_baseline_windows",
+        help="Number of baseline windows for spectral detector (default: 10).",
+    )
+    ads_parser.add_argument(
+        "--spectral-min-duration",
+        type=float,
+        default=5.0,
+        dest="spectral_min_duration_s",
+        help="Minimum spectrally dissimilar segment to remove in seconds (default: 5.0).",
+    )
+    ads_parser.add_argument(
+        "--spectral-max-duration",
+        type=float,
+        default=120.0,
+        dest="spectral_max_duration_s",
+        help="Maximum spectrally dissimilar segment to remove in seconds (default: 120.0).",
     )
     ads_parser.add_argument(
         "--fade-ms",
