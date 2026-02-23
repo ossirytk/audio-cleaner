@@ -1,19 +1,19 @@
 """Ad / interrupt detection and removal for FLAC and WAV audio files.
 
-This module implements several methods for detecting and removing ads, jingles,
-silence gaps, and other interrupts from audio recordings.
+Supports removal of advertisements, station IDs / jingles, and sponsorship reads
+from audio recordings using either user-specified timestamps or audio fingerprinting
+against known reference clips.
 
 Methods
 -------
-- Silence / gap detection (RMS energy threshold)
-- Loudness change-point detection (numpy.diff derivative threshold)
-- Spectral dissimilarity detection (MFCC cosine distance via librosa)
-- Clean segment reassembly with raised-cosine crossfade
+- Timestamp-based removal: user provides (start_s, end_s) intervals to remove.
+- Fingerprint-based detection: normalized cross-correlation against reference clips.
+- Clean segment reassembly with raised-cosine crossfade.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -30,21 +30,6 @@ Segment = tuple[int, int]  # (start_sample, end_sample) inclusive start, exclusi
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _rms_db(frame: AudioArray) -> float:
-    """Return the RMS level of *frame* in dBFS.
-
-    Args:
-        frame: A 1-D float32 audio frame.
-
-    Returns:
-        RMS level in dBFS. Returns -120.0 for silent (zero) frames.
-    """
-    rms = float(np.sqrt(np.mean(frame**2)))
-    if rms < 1e-10:
-        return -120.0
-    return 20.0 * np.log10(rms)
 
 
 def _raised_cosine_fade(length: int) -> AudioArray:
@@ -123,327 +108,105 @@ def _apply_crossfade(
 
 
 # ---------------------------------------------------------------------------
-# Detector classes
+# Fingerprint detector
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class SilenceDetector:
-    """Detect silence / dead-air segments using per-frame RMS energy.
-
-    Segments that are entirely below *threshold_db* for between *min_duration_s*
-    and *max_duration_s* seconds are flagged for removal.
+def _normalized_cross_correlation(
+    audio: npt.NDArray[np.float64],
+    reference: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Compute normalized cross-correlation between *audio* and *reference*.
 
     Args:
-        threshold_db: Silence threshold in dBFS (default: -45.0).
-        frame_ms: Analysis frame length in milliseconds (default: 20.0).
-        min_duration_s: Minimum silent segment length to remove in seconds (default: 1.0).
-        max_duration_s: Maximum silent segment length to remove in seconds (default: 30.0).
+        audio: 1-D float64 audio array.
+        reference: 1-D float64 reference clip, must be shorter than *audio*.
+
+    Returns:
+        Array of NCC values at each valid position
+        (length = ``len(audio) - len(reference) + 1``).  Values are in [-1, 1].
+    """
+    from scipy.signal import correlate  # type: ignore[attr-defined]
+
+    ref_len = len(reference)
+    n_positions = len(audio) - ref_len + 1
+    if n_positions <= 0:
+        return np.array([], dtype=np.float64)
+
+    ref_energy = float(np.sqrt(np.dot(reference, reference)))
+    if ref_energy < 1e-10:
+        return np.zeros(n_positions, dtype=np.float64)
+
+    corr = correlate(audio, reference, mode="valid")
+
+    # Compute rolling L2 norm of audio windows using prefix sums
+    audio_sq = audio**2
+    cumsum = np.concatenate([[0.0], np.cumsum(audio_sq)])
+    window_energies = np.sqrt(np.maximum(0.0, cumsum[ref_len:] - cumsum[:n_positions]))
+
+    denom = ref_energy * window_energies
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ncc = np.where(denom > 1e-10, corr / denom, 0.0)
+    return ncc
+
+
+@dataclass
+class FingerprintDetector:
+    """Detect ad/jingle segments by matching against known reference audio clips.
+
+    Uses normalized cross-correlation to locate occurrences of known
+    advertisement, station ID / jingle, or sponsorship read clips within the audio.
+
+    Args:
+        reference_clips: List of known ad/jingle audio arrays (1-D or 2-D float32).
+        correlation_threshold: Minimum normalized cross-correlation score to flag
+            a match (default: 0.7).
     """
 
-    threshold_db: float = -45.0
-    frame_ms: float = 20.0
-    min_duration_s: float = 1.0
-    max_duration_s: float = 30.0
+    reference_clips: list[AudioArray]
+    correlation_threshold: float = 0.7
 
     def detect(self, audio: AudioArray, sample_rate: int) -> list[Segment]:
-        """Return a list of (start, end) sample pairs that are silent.
+        """Return a list of (start, end) sample pairs that match a reference clip.
 
         Args:
             audio: 1-D or 2-D float32 audio array.
             sample_rate: Sample rate in Hz.
 
         Returns:
-            Sorted list of (start_sample, end_sample) silent segments.
+            Sorted list of (start_sample, end_sample) matched segments.
         """
         mono = audio if audio.ndim == 1 else audio.mean(axis=1).astype(np.float32)
-        frame_len = max(1, int(sample_rate * self.frame_ms / 1000.0))
-        n_samples = mono.shape[0]
-        min_frames = max(1, int(self.min_duration_s * sample_rate / frame_len))
-        max_frames = int(self.max_duration_s * sample_rate / frame_len)
+        audio_f64 = mono.astype(np.float64)
 
-        silent_flags: list[bool] = []
-        for i in range(0, n_samples, frame_len):
-            frame = mono[i : i + frame_len]
-            silent_flags.append(_rms_db(frame) < self.threshold_db)
-
-        # Group consecutive silent frames
         segments: list[Segment] = []
-        run_start: int | None = None
-        for idx, is_silent in enumerate(silent_flags):
-            if is_silent and run_start is None:
-                run_start = idx
-            elif not is_silent and run_start is not None:
-                run_len = idx - run_start
-                if min_frames <= run_len <= max_frames:
-                    start_sample = run_start * frame_len
-                    end_sample = min(idx * frame_len, n_samples)
-                    segments.append((start_sample, end_sample))
-                run_start = None
-        if run_start is not None:
-            run_len = len(silent_flags) - run_start
-            if min_frames <= run_len <= max_frames:
-                start_sample = run_start * frame_len
-                end_sample = n_samples
-                segments.append((start_sample, end_sample))
+        for ref in self.reference_clips:
+            ref_mono = ref if ref.ndim == 1 else ref.mean(axis=1).astype(np.float32)
+            ref_f64 = ref_mono.astype(np.float64)
+            ref_len = len(ref_f64)
+            if ref_len == 0 or ref_len > len(audio_f64):
+                continue
 
-        return segments
+            ncc = _normalized_cross_correlation(audio_f64, ref_f64)
+            # Walk through ncc and collect non-overlapping matches
+            pos = 0
+            n = len(ncc)
+            while pos < n:
+                if ncc[pos] >= self.correlation_threshold:
+                    # Find the best-matching position within this window
+                    end_search = min(pos + ref_len, n)
+                    best_pos = pos + int(np.argmax(ncc[pos:end_search]))
+                    segments.append((best_pos, best_pos + ref_len))
+                    pos = best_pos + ref_len  # skip past this match
+                else:
+                    pos += 1
 
-
-@dataclass
-class LoudnessChangeDetector:
-    """Detect ad segments via abrupt loudness changes using ``numpy.diff``.
-
-    Computes a short-term RMS loudness for each 1-second window, then uses a
-    first-order difference to flag abrupt jumps.  Windows that are both loud
-    (above *baseline + loudness_jump_db*) are merged into candidate segments.
-
-    Args:
-        window_s: Analysis window length in seconds (default: 1.0).
-        loudness_jump_db: Minimum loudness jump in dB to flag a change point
-            (default: 8.0).
-        min_duration_s: Minimum segment length to remove in seconds (default: 5.0).
-        max_duration_s: Maximum segment length to remove in seconds (default: 120.0).
-    """
-
-    window_s: float = 1.0
-    loudness_jump_db: float = 8.0
-    min_duration_s: float = 5.0
-    max_duration_s: float = 120.0
-
-    def detect(self, audio: AudioArray, sample_rate: int) -> list[Segment]:
-        """Return a list of (start, end) sample pairs that are likely ad segments.
-
-        Args:
-            audio: 1-D or 2-D float32 audio array.
-            sample_rate: Sample rate in Hz.
-
-        Returns:
-            Sorted list of (start_sample, end_sample) candidate segments.
-        """
-        mono = audio if audio.ndim == 1 else audio.mean(axis=1).astype(np.float32)
-        win_len = max(1, int(sample_rate * self.window_s))
-        n_samples = mono.shape[0]
-        n_windows = n_samples // win_len
-
-        if n_windows < 2:
-            return []
-
-        # Compute per-window RMS in dBFS
-        loudness: list[float] = []
-        for i in range(n_windows):
-            frame = mono[i * win_len : (i + 1) * win_len]
-            loudness.append(_rms_db(frame))
-
-        loudness_arr = np.array(loudness, dtype=np.float64)
-        baseline_db = float(np.median(loudness_arr))
-
-        # Flag windows that are significantly louder than baseline
-        loud_flags = loudness_arr > (baseline_db + self.loudness_jump_db)
-
-        # Also flag change points (abrupt jumps) — windows immediately after a
-        # large positive derivative spike
-        diffs = np.diff(loudness_arr)
-        jump_flags = np.zeros(n_windows, dtype=bool)
-        jump_flags[1:] = diffs > self.loudness_jump_db
-
-        candidate_flags = loud_flags | jump_flags
-
-        # Group consecutive flagged windows into segments
-        segments: list[Segment] = []
-        run_start: int | None = None
-        min_wins = max(1, int(self.min_duration_s / self.window_s))
-        max_wins = int(self.max_duration_s / self.window_s)
-
-        for idx, flagged in enumerate(candidate_flags):
-            if flagged and run_start is None:
-                run_start = idx
-            elif not flagged and run_start is not None:
-                run_len = idx - run_start
-                if min_wins <= run_len <= max_wins:
-                    segments.append((run_start * win_len, min(idx * win_len, n_samples)))
-                run_start = None
-        if run_start is not None:
-            run_len = n_windows - run_start
-            if min_wins <= run_len <= max_wins:
-                segments.append((run_start * win_len, n_samples))
-
-        return segments
-
-
-@dataclass
-class SpectralDissimilarityDetector:
-    """Detect ad segments by comparing MFCC features to a rolling programme baseline.
-
-    Uses ``librosa`` to compute MFCCs for each 1-second window, builds a moving
-    baseline from the first *baseline_windows* windows, then flags windows whose
-    cosine distance from the baseline exceeds *distance_threshold*.
-
-    Args:
-        window_s: Analysis window length in seconds (default: 1.0).
-        n_mfcc: Number of MFCC coefficients (default: 13).
-        baseline_windows: Number of initial windows used to build the programme
-            baseline (default: 10).
-        distance_threshold: Cosine distance threshold for flagging a window
-            (default: 0.15).
-        min_duration_s: Minimum segment length to remove in seconds (default: 5.0).
-        max_duration_s: Maximum segment length to remove in seconds (default: 120.0).
-    """
-
-    window_s: float = 1.0
-    n_mfcc: int = 13
-    baseline_windows: int = 10
-    distance_threshold: float = 0.15
-    min_duration_s: float = 5.0
-    max_duration_s: float = 120.0
-
-    def detect(self, audio: AudioArray, sample_rate: int) -> list[Segment]:
-        """Return a list of (start, end) sample pairs that are spectrally dissimilar.
-
-        Args:
-            audio: 1-D or 2-D float32 audio array.
-            sample_rate: Sample rate in Hz.
-
-        Returns:
-            Sorted list of (start_sample, end_sample) candidate segments.
-        """
-        import librosa
-        from scipy.spatial.distance import cosine as cosine_distance
-
-        mono = audio if audio.ndim == 1 else audio.mean(axis=1).astype(np.float32)
-        win_len = max(1, int(sample_rate * self.window_s))
-        n_samples = mono.shape[0]
-        n_windows = n_samples // win_len
-
-        if n_windows < self.baseline_windows + 1:
-            return []
-
-        # Compute MFCCs once for the entire signal, then aggregate per window
-        hop_length = 512
-        mfcc_full = librosa.feature.mfcc(
-            y=mono,
-            sr=sample_rate,
-            n_mfcc=self.n_mfcc,
-            hop_length=hop_length,
-        )
-        # Number of MFCC frames that approximately span one analysis window
-        frames_per_window = max(1, win_len // hop_length)
-        max_mfcc_windows = mfcc_full.shape[1] // frames_per_window
-        n_windows = min(n_windows, max_mfcc_windows)
-
-        if n_windows < self.baseline_windows + 1:
-            return []
-
-        # Compute mean MFCC vector for each window by averaging frames in that window
-        mfcc_vectors: list[npt.NDArray[np.float64]] = []
-        for i in range(n_windows):
-            start_frame = i * frames_per_window
-            end_frame = start_frame + frames_per_window
-            mfcc_vectors.append(mfcc_full[:, start_frame:end_frame].mean(axis=1))
-
-        # Baseline: mean of first N windows
-        baseline = np.mean(mfcc_vectors[: self.baseline_windows], axis=0)
-
-        # Flag windows with high cosine distance from baseline
-        min_wins = max(1, int(self.min_duration_s / self.window_s))
-        max_wins = int(self.max_duration_s / self.window_s)
-
-        candidate_flags = np.zeros(n_windows, dtype=bool)
-        for i in range(self.baseline_windows, n_windows):
-            dist = cosine_distance(mfcc_vectors[i], baseline)
-            # NaN arises when a vector has zero norm (e.g., completely silent window).
-            # A zero-norm MFCC vector is degenerate and indicates unusual audio content,
-            # so we conservatively flag it rather than silently skip it.
-            if np.isnan(dist):
-                candidate_flags[i] = True
-            else:
-                candidate_flags[i] = dist > self.distance_threshold
-
-        # Group consecutive flagged windows into segments
-        segments: list[Segment] = []
-        run_start: int | None = None
-        for idx, flagged in enumerate(candidate_flags):
-            if flagged and run_start is None:
-                run_start = idx
-            elif not flagged and run_start is not None:
-                run_len = idx - run_start
-                if min_wins <= run_len <= max_wins:
-                    segments.append((run_start * win_len, min(idx * win_len, n_samples)))
-                run_start = None
-        if run_start is not None:
-            run_len = n_windows - run_start
-            if min_wins <= run_len <= max_wins:
-                segments.append((run_start * win_len, n_samples))
-
-        return segments
+        return sorted(segments)
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class AdRemovalConfig:
-    """Configuration for :func:`remove_ads`.
-
-    Args:
-        strategy: Detection strategy to use.  One of ``"silence"``,
-            ``"loudness"``, ``"spectral"``, or ``"combined"`` (default: ``"silence"``).
-        silence_threshold_db: Silence threshold in dBFS for the silence detector
-            (default: -45.0).
-        silence_min_duration_s: Minimum silent segment duration in seconds (default: 1.0).
-        silence_max_duration_s: Maximum silent segment duration in seconds (default: 30.0).
-        loudness_jump_db: Loudness jump threshold in dB for the loudness detector
-            (default: 8.0).
-        loudness_min_duration_s: Minimum loudness-change segment duration in seconds
-            (default: 5.0).
-        loudness_max_duration_s: Maximum loudness-change segment duration in seconds
-            (default: 120.0).
-        spectral_distance_threshold: Cosine distance threshold for spectral dissimilarity
-            (default: 0.15).
-        spectral_baseline_windows: Number of baseline windows for spectral detector
-            (default: 10).
-        spectral_min_duration_s: Minimum spectral-dissimilarity segment duration in seconds
-            (default: 5.0).
-        spectral_max_duration_s: Maximum spectral-dissimilarity segment duration in seconds
-            (default: 120.0).
-        fade_ms: Crossfade duration at cut points in milliseconds (default: 20.0).
-    """
-
-    strategy: Literal["silence", "loudness", "spectral", "combined"] = "silence"
-    silence_threshold_db: float = -45.0
-    silence_min_duration_s: float = 1.0
-    silence_max_duration_s: float = 30.0
-    loudness_jump_db: float = 8.0
-    loudness_min_duration_s: float = 5.0
-    loudness_max_duration_s: float = 120.0
-    spectral_distance_threshold: float = 0.15
-    spectral_baseline_windows: int = 10
-    spectral_min_duration_s: float = 5.0
-    spectral_max_duration_s: float = 120.0
-    fade_ms: float = 20.0
-    _silence_detector: SilenceDetector = field(init=False, repr=False)
-    _loudness_detector: LoudnessChangeDetector = field(init=False, repr=False)
-    _spectral_detector: SpectralDissimilarityDetector = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self._silence_detector = SilenceDetector(
-            threshold_db=self.silence_threshold_db,
-            min_duration_s=self.silence_min_duration_s,
-            max_duration_s=self.silence_max_duration_s,
-        )
-        self._loudness_detector = LoudnessChangeDetector(
-            loudness_jump_db=self.loudness_jump_db,
-            min_duration_s=self.loudness_min_duration_s,
-            max_duration_s=self.loudness_max_duration_s,
-        )
-        self._spectral_detector = SpectralDissimilarityDetector(
-            distance_threshold=self.spectral_distance_threshold,
-            baseline_windows=self.spectral_baseline_windows,
-            min_duration_s=self.spectral_min_duration_s,
-            max_duration_s=self.spectral_max_duration_s,
-        )
 
 
 def _merge_segments(segments: list[Segment]) -> list[Segment]:
@@ -471,38 +234,32 @@ def _merge_segments(segments: list[Segment]) -> list[Segment]:
 def remove_ads(
     audio: AudioArray,
     sample_rate: int,
-    strategy: Literal["silence", "loudness", "spectral", "combined"] = "silence",
+    strategy: Literal["timestamps", "fingerprint", "combined"] = "timestamps",
     *,
-    silence_threshold_db: float = -45.0,
-    silence_min_duration_s: float = 1.0,
-    silence_max_duration_s: float = 30.0,
-    loudness_jump_db: float = 8.0,
-    loudness_min_duration_s: float = 5.0,
-    loudness_max_duration_s: float = 120.0,
-    spectral_distance_threshold: float = 0.15,
-    spectral_baseline_windows: int = 10,
-    spectral_min_duration_s: float = 5.0,
-    spectral_max_duration_s: float = 120.0,
+    timestamps: list[tuple[float, float]] | None = None,
+    reference_clips: list[AudioArray] | None = None,
+    correlation_threshold: float = 0.7,
     fade_ms: float = 20.0,
 ) -> AudioArray:
     """Detect and remove ads / interrupts from *audio*.
 
+    Supports removal of advertisements, station IDs / jingles, and sponsorship
+    reads.  The user can specify the segments to remove directly via *timestamps*,
+    or let the fingerprint detector locate occurrences of known *reference_clips*
+    automatically.
+
     Args:
         audio: 1-D (mono) or 2-D (samples x channels) float32 audio array.
         sample_rate: Sample rate in Hz.
-        strategy: Detection strategy.  One of ``"silence"``, ``"loudness"``,
-            ``"spectral"``, or ``"combined"``.
-        silence_threshold_db: Silence threshold in dBFS (default: -45.0).
-        silence_min_duration_s: Minimum silent segment to remove in seconds (default: 1.0).
-        silence_max_duration_s: Maximum silent segment to remove in seconds (default: 30.0).
-        loudness_jump_db: Loudness jump threshold in dB (default: 8.0).
-        loudness_min_duration_s: Minimum loudness-change segment in seconds (default: 5.0).
-        loudness_max_duration_s: Maximum loudness-change segment in seconds (default: 120.0).
-        spectral_distance_threshold: Cosine distance threshold for spectral detector
-            (default: 0.15).
-        spectral_baseline_windows: Baseline window count for spectral detector (default: 10).
-        spectral_min_duration_s: Minimum spectral-dissimilarity segment in seconds (default: 5.0).
-        spectral_max_duration_s: Maximum spectral-dissimilarity segment in seconds (default: 120.0).
+        strategy: Removal strategy.  One of ``"timestamps"``, ``"fingerprint"``,
+            or ``"combined"``.
+        timestamps: List of ``(start_s, end_s)`` pairs (in seconds) marking segments
+            to remove.  Required when *strategy* is ``"timestamps"`` or ``"combined"``.
+        reference_clips: List of known ad/jingle audio arrays used for fingerprint
+            matching.  Required when *strategy* is ``"fingerprint"`` or
+            ``"combined"``.
+        correlation_threshold: Minimum normalized cross-correlation score for the
+            fingerprint detector to flag a match (default: 0.7).
         fade_ms: Crossfade duration at cut points in milliseconds (default: 20.0).
 
     Returns:
@@ -514,7 +271,13 @@ def remove_ads(
         from audio_cleaner.ads import remove_ads
 
         audio, sr = sf.read("podcast.flac", dtype="float32")
-        cleaned = remove_ads(audio, sr, strategy="silence")
+
+        # Remove known segments by timestamp
+        cleaned = remove_ads(
+            audio, sr,
+            strategy="timestamps",
+            timestamps=[(30.0, 45.0), (120.0, 135.0)],
+        )
         sf.write("podcast_cleaned.flac", cleaned, sr)
     """
     if sample_rate <= 0:
@@ -527,57 +290,30 @@ def remove_ads(
         raise ValueError("audio must not be empty")
     if fade_ms < 0:
         raise ValueError(f"fade_ms must be >= 0, got {fade_ms}")
-    if silence_min_duration_s < 0:
-        raise ValueError(f"silence_min_duration_s must be >= 0, got {silence_min_duration_s}")
-    if silence_max_duration_s < silence_min_duration_s:
-        raise ValueError(
-            f"silence_max_duration_s ({silence_max_duration_s}) must be >= "
-            f"silence_min_duration_s ({silence_min_duration_s})"
-        )
-    if loudness_min_duration_s < 0:
-        raise ValueError(f"loudness_min_duration_s must be >= 0, got {loudness_min_duration_s}")
-    if loudness_max_duration_s < loudness_min_duration_s:
-        raise ValueError(
-            f"loudness_max_duration_s ({loudness_max_duration_s}) must be >= "
-            f"loudness_min_duration_s ({loudness_min_duration_s})"
-        )
-    if spectral_min_duration_s < 0:
-        raise ValueError(f"spectral_min_duration_s must be >= 0, got {spectral_min_duration_s}")
-    if spectral_max_duration_s < spectral_min_duration_s:
-        raise ValueError(
-            f"spectral_max_duration_s ({spectral_max_duration_s}) must be >= "
-            f"spectral_min_duration_s ({spectral_min_duration_s})"
-        )
-    if spectral_baseline_windows < 1:
-        raise ValueError(
-            f"spectral_baseline_windows must be >= 1, got {spectral_baseline_windows}"
-        )
-
-    cfg = AdRemovalConfig(
-        strategy=strategy,
-        silence_threshold_db=silence_threshold_db,
-        silence_min_duration_s=silence_min_duration_s,
-        silence_max_duration_s=silence_max_duration_s,
-        loudness_jump_db=loudness_jump_db,
-        loudness_min_duration_s=loudness_min_duration_s,
-        loudness_max_duration_s=loudness_max_duration_s,
-        spectral_distance_threshold=spectral_distance_threshold,
-        spectral_baseline_windows=spectral_baseline_windows,
-        spectral_min_duration_s=spectral_min_duration_s,
-        spectral_max_duration_s=spectral_max_duration_s,
-        fade_ms=fade_ms,
-    )
+    if not (0 < correlation_threshold <= 1):
+        raise ValueError(f"correlation_threshold must be in (0, 1], got {correlation_threshold}")
 
     segments: list[Segment] = []
 
-    if strategy in ("silence", "combined"):
-        segments.extend(cfg._silence_detector.detect(audio, sample_rate))
+    if strategy in ("timestamps", "combined"):
+        if timestamps:
+            for start_s, end_s in timestamps:
+                if end_s <= start_s:
+                    raise ValueError(
+                        f"timestamp end ({end_s}) must be greater than start ({start_s})"
+                    )
+                start_sample = max(0, int(start_s * sample_rate))
+                end_sample = min(audio.shape[0], int(end_s * sample_rate))
+                if start_sample < end_sample:
+                    segments.append((start_sample, end_sample))
 
-    if strategy in ("loudness", "combined"):
-        segments.extend(cfg._loudness_detector.detect(audio, sample_rate))
-
-    if strategy in ("spectral", "combined"):
-        segments.extend(cfg._spectral_detector.detect(audio, sample_rate))
+    if strategy in ("fingerprint", "combined"):
+        if reference_clips:
+            detector = FingerprintDetector(
+                reference_clips=reference_clips,
+                correlation_threshold=correlation_threshold,
+            )
+            segments.extend(detector.detect(audio, sample_rate))
 
     if not segments:
         return audio.copy()

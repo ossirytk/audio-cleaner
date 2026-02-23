@@ -9,7 +9,7 @@ from typing import Literal
 
 from audio_cleaner import __version__
 
-_AD_STRATEGIES = ("silence", "loudness", "spectral", "combined")
+_AD_STRATEGIES = ("timestamps", "fingerprint", "combined")
 
 
 def _run_remove_ads(args: argparse.Namespace) -> None:
@@ -20,7 +20,7 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
     """
     import soundfile as sf
 
-    from audio_cleaner.ads import remove_ads
+    from audio_cleaner.ads import AudioArray, remove_ads
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
@@ -49,7 +49,35 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
         print(f"No FLAC or WAV files found in '{input_path}'.", file=sys.stderr)
         sys.exit(1)
 
-    strategy: Literal["silence", "loudness", "spectral", "combined"] = args.strategy
+    strategy: Literal["timestamps", "fingerprint", "combined"] = args.strategy
+
+    # Parse timestamps: each entry is "start,end" in seconds
+    timestamps: list[tuple[float, float]] | None = None
+    if args.timestamps:
+        timestamps = []
+        for ts in args.timestamps:
+            try:
+                start_s, end_s = ts.split(",")
+                timestamps.append((float(start_s), float(end_s)))
+            except ValueError:
+                print(
+                    f"Error: invalid timestamp '{ts}'. "
+                    "Expected format: start,end (e.g. 30.0,45.0).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    # Load reference clips for fingerprint strategy
+    reference_clips: list[AudioArray] | None = None
+    if args.reference_clips:
+        reference_clips = []
+        for clip_path in args.reference_clips:
+            try:
+                clip, _ = sf.read(clip_path, dtype="float32")
+                reference_clips.append(clip)  # type: ignore[arg-type]
+            except Exception as exc:
+                print(f"Error: could not load reference clip '{clip_path}': {exc}", file=sys.stderr)
+                sys.exit(1)
 
     errors: list[str] = []
     for audio_file in audio_files:
@@ -57,19 +85,12 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
         try:
             audio, sr = sf.read(str(audio_file), dtype="float32")
             cleaned = remove_ads(
-                audio,
+                audio,  # type: ignore[arg-type]
                 sr,
                 strategy=strategy,
-                silence_threshold_db=args.silence_threshold_db,
-                silence_min_duration_s=args.silence_min_duration_s,
-                silence_max_duration_s=args.silence_max_duration_s,
-                loudness_jump_db=args.loudness_jump_db,
-                loudness_min_duration_s=args.loudness_min_duration_s,
-                loudness_max_duration_s=args.loudness_max_duration_s,
-                spectral_distance_threshold=args.spectral_distance_threshold,
-                spectral_baseline_windows=args.spectral_baseline_windows,
-                spectral_min_duration_s=args.spectral_min_duration_s,
-                spectral_max_duration_s=args.spectral_max_duration_s,
+                timestamps=timestamps,
+                reference_clips=reference_clips,
+                correlation_threshold=args.correlation_threshold,
                 fade_ms=args.fade_ms,
             )
             # Preserve relative directory structure when input is a directory
@@ -130,78 +151,37 @@ def main() -> None:
     ads_parser.add_argument(
         "--strategy",
         choices=_AD_STRATEGIES,
-        default="silence",
-        help="Ad detection strategy (default: silence).",
+        default="timestamps",
+        help="Ad detection strategy (default: timestamps).",
     )
     ads_parser.add_argument(
-        "--silence-threshold-db",
+        "--timestamps",
+        nargs="+",
+        metavar="START,END",
+        dest="timestamps",
+        help=(
+            "One or more time intervals to remove, each as 'start,end' in seconds "
+            "(e.g. --timestamps 30.0,45.0 120.5,135.0)."
+        ),
+    )
+    ads_parser.add_argument(
+        "--reference-clips",
+        nargs="+",
+        metavar="FILE",
+        dest="reference_clips",
+        help=(
+            "One or more FLAC/WAV reference clip files (ads, jingles, sponsorship reads) "
+            "used for fingerprint-based detection."
+        ),
+    )
+    ads_parser.add_argument(
+        "--correlation-threshold",
         type=float,
-        default=-45.0,
-        dest="silence_threshold_db",
-        help="Silence threshold in dBFS (default: -45.0).",
-    )
-    ads_parser.add_argument(
-        "--silence-min-duration",
-        type=float,
-        default=1.0,
-        dest="silence_min_duration_s",
-        help="Minimum silent gap to remove in seconds (default: 1.0).",
-    )
-    ads_parser.add_argument(
-        "--silence-max-duration",
-        type=float,
-        default=30.0,
-        dest="silence_max_duration_s",
-        help="Maximum silent gap to remove in seconds (default: 30.0).",
-    )
-    ads_parser.add_argument(
-        "--loudness-jump-db",
-        type=float,
-        default=8.0,
-        dest="loudness_jump_db",
-        help="Loudness jump threshold in dB (default: 8.0).",
-    )
-    ads_parser.add_argument(
-        "--loudness-min-duration",
-        type=float,
-        default=5.0,
-        dest="loudness_min_duration_s",
-        help="Minimum loud segment to remove in seconds (default: 5.0).",
-    )
-    ads_parser.add_argument(
-        "--loudness-max-duration",
-        type=float,
-        default=120.0,
-        dest="loudness_max_duration_s",
-        help="Maximum loud segment to remove in seconds (default: 120.0).",
-    )
-    ads_parser.add_argument(
-        "--spectral-distance-threshold",
-        type=float,
-        default=0.15,
-        dest="spectral_distance_threshold",
-        help="Cosine distance threshold for spectral detector (default: 0.15).",
-    )
-    ads_parser.add_argument(
-        "--spectral-baseline-windows",
-        type=int,
-        default=10,
-        dest="spectral_baseline_windows",
-        help="Number of baseline windows for spectral detector (default: 10).",
-    )
-    ads_parser.add_argument(
-        "--spectral-min-duration",
-        type=float,
-        default=5.0,
-        dest="spectral_min_duration_s",
-        help="Minimum spectrally dissimilar segment to remove in seconds (default: 5.0).",
-    )
-    ads_parser.add_argument(
-        "--spectral-max-duration",
-        type=float,
-        default=120.0,
-        dest="spectral_max_duration_s",
-        help="Maximum spectrally dissimilar segment to remove in seconds (default: 120.0).",
+        default=0.7,
+        dest="correlation_threshold",
+        help=(
+            "Minimum normalized cross-correlation score to flag a fingerprint match (default: 0.7)."
+        ),
     )
     ads_parser.add_argument(
         "--fade-ms",

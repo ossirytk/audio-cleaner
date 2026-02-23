@@ -6,17 +6,14 @@ import numpy as np
 import pytest
 
 from audio_cleaner.ads import (
-    LoudnessChangeDetector,
-    SilenceDetector,
-    SpectralDissimilarityDetector,
+    FingerprintDetector,
     _apply_crossfade,
     _merge_segments,
-    _rms_db,
+    _normalized_cross_correlation,
     remove_ads,
 )
 
 SAMPLE_RATE = 16000  # 16 kHz — fast enough for tests
-FULL_SCALE_SINE_RMS_DB = 20 * np.log10(1 / np.sqrt(2))  # ~= -3.01 dBFS
 
 
 # ---------------------------------------------------------------------------
@@ -37,22 +34,6 @@ def _silence(duration_s: float, sr: int = SAMPLE_RATE) -> np.ndarray:
 
 def _concat(*parts: np.ndarray) -> np.ndarray:
     return np.concatenate(parts)
-
-
-# ---------------------------------------------------------------------------
-# _rms_db
-# ---------------------------------------------------------------------------
-
-
-def test_rms_db_silence() -> None:
-    assert _rms_db(np.zeros(100, dtype=np.float32)) == pytest.approx(-120.0)
-
-
-def test_rms_db_full_scale() -> None:
-    # Full-scale sine has RMS of 1/sqrt(2) ~= -3 dBFS
-    t = np.linspace(0, 1, 16000, endpoint=False)
-    sig = np.sin(2 * np.pi * 1000 * t).astype(np.float32)
-    assert _rms_db(sig) == pytest.approx(FULL_SCALE_SINE_RMS_DB, abs=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -113,130 +94,97 @@ def test_apply_crossfade_stereo() -> None:
 
 
 # ---------------------------------------------------------------------------
-# SilenceDetector
+# _normalized_cross_correlation
 # ---------------------------------------------------------------------------
 
 
-def test_silence_detector_no_silence() -> None:
-    audio = _sine(440, 3.0)
-    det = SilenceDetector(threshold_db=-45.0, min_duration_s=1.0)
-    assert det.detect(audio, SAMPLE_RATE) == []
+def test_ncc_perfect_match() -> None:
+    """NCC should be 1.0 at the position of an exact match."""
+    ref = _sine(1000, 0.5).astype(np.float64)
+    offset_samples = int(0.5 * SAMPLE_RATE)
+    audio = _concat(_silence(0.5), _sine(1000, 0.5), _silence(0.5)).astype(np.float64)
+    ncc = _normalized_cross_correlation(audio, ref)
+    assert ncc.max() == pytest.approx(1.0, abs=1e-5)
+    # Peak should be at the start of the matching segment (~0.5 s offset)
+    assert int(ncc.argmax()) == pytest.approx(offset_samples, abs=10)
 
 
-def test_silence_detector_detects_gap() -> None:
-    """A 2-second silent gap should be detected."""
-    audio = _concat(_sine(440, 1.0), _silence(2.0), _sine(440, 1.0))
-    det = SilenceDetector(threshold_db=-45.0, min_duration_s=1.0, max_duration_s=30.0)
+def test_ncc_no_match() -> None:
+    """NCC for a reference clip longer than the audio should return an empty array."""
+    ref = _sine(440, 2.0).astype(np.float64)
+    audio = _sine(440, 1.0).astype(np.float64)
+    ncc = _normalized_cross_correlation(audio, ref)
+    assert len(ncc) == 0
+
+
+def test_ncc_silent_reference() -> None:
+    """A zero-energy reference should return zeros, not raise."""
+    ref = np.zeros(100, dtype=np.float64)
+    audio = _sine(440, 1.0).astype(np.float64)
+    ncc = _normalized_cross_correlation(audio, ref)
+    assert np.all(ncc == 0.0)
+
+
+# ---------------------------------------------------------------------------
+# FingerprintDetector
+# ---------------------------------------------------------------------------
+
+
+def test_fingerprint_detector_finds_exact_clip() -> None:
+    """Detector should locate an exact copy of the reference clip in the audio."""
+    jingle = _sine(2000, 2.0)  # 2-second jingle at 2 kHz
+    audio = _concat(_sine(440, 5.0), jingle, _sine(440, 5.0))
+    det = FingerprintDetector(reference_clips=[jingle], correlation_threshold=0.9)
     segs = det.detect(audio, SAMPLE_RATE)
     assert len(segs) == 1
-    start, end = segs[0]
-    # The gap starts at ~1 s and ends at ~3 s
-    assert start == pytest.approx(SAMPLE_RATE, abs=SAMPLE_RATE * 0.05)
-    assert end == pytest.approx(3 * SAMPLE_RATE, abs=SAMPLE_RATE * 0.05)
-
-
-def test_silence_detector_ignores_short_gap() -> None:
-    """A 0.5-second gap is shorter than min_duration_s and should not be flagged."""
-    audio = _concat(_sine(440, 1.0), _silence(0.5), _sine(440, 1.0))
-    det = SilenceDetector(threshold_db=-45.0, min_duration_s=1.0)
-    assert det.detect(audio, SAMPLE_RATE) == []
-
-
-def test_silence_detector_ignores_long_gap() -> None:
-    """A 35-second gap is longer than max_duration_s=30 and should not be flagged."""
-    audio = _concat(_sine(440, 1.0), _silence(35.0), _sine(440, 1.0))
-    det = SilenceDetector(threshold_db=-45.0, min_duration_s=1.0, max_duration_s=30.0)
-    assert det.detect(audio, SAMPLE_RATE) == []
-
-
-def test_silence_detector_stereo() -> None:
-    mono_gap = _concat(_sine(440, 1.0), _silence(2.0), _sine(440, 1.0))
-    stereo = np.stack([mono_gap, mono_gap], axis=1)
-    det = SilenceDetector(threshold_db=-45.0, min_duration_s=1.0)
-    segs = det.detect(stereo, SAMPLE_RATE)
-    assert len(segs) == 1
-
-
-# ---------------------------------------------------------------------------
-# LoudnessChangeDetector
-# ---------------------------------------------------------------------------
-
-
-def test_loudness_detector_no_change() -> None:
-    """Uniform audio should produce no segments."""
-    audio = _sine(440, 30.0, amp=0.1)
-    det = LoudnessChangeDetector(loudness_jump_db=8.0, min_duration_s=5.0)
-    assert det.detect(audio, SAMPLE_RATE) == []
-
-
-def test_loudness_detector_detects_loud_burst() -> None:
-    """A loud burst embedded in quiet audio should be detected."""
-    quiet = _sine(440, 10.0, amp=0.01)
-    loud = _sine(440, 15.0, amp=0.9)
-    quiet2 = _sine(440, 10.0, amp=0.01)
-    audio = _concat(quiet, loud, quiet2)
-    det = LoudnessChangeDetector(loudness_jump_db=8.0, min_duration_s=5.0, max_duration_s=120.0)
-    segs = det.detect(audio, SAMPLE_RATE)
-    assert len(segs) >= 1
-    # The detected segment should be roughly in the middle 10-25 s region
     start_s = segs[0][0] / SAMPLE_RATE
-    assert 5.0 <= start_s <= 15.0
+    end_s = segs[0][1] / SAMPLE_RATE
+    assert start_s == pytest.approx(5.0, abs=0.1)
+    assert end_s == pytest.approx(7.0, abs=0.1)
 
 
-def test_loudness_detector_too_short() -> None:
-    """A loud burst shorter than min_duration_s should not be returned."""
-    quiet = _sine(440, 10.0, amp=0.01)
-    loud = _sine(440, 2.0, amp=0.9)  # only 2 s < min_duration_s=5.0
-    quiet2 = _sine(440, 10.0, amp=0.01)
-    audio = _concat(quiet, loud, quiet2)
-    det = LoudnessChangeDetector(loudness_jump_db=8.0, min_duration_s=5.0)
-    assert det.detect(audio, SAMPLE_RATE) == []
-
-
-def test_loudness_detector_too_long() -> None:
-    """A loud burst longer than max_duration_s should not be returned."""
-    quiet = _sine(440, 10.0, amp=0.01)
-    loud = _sine(440, 130.0, amp=0.9)  # 130 s > max_duration_s=120.0
-    quiet2 = _sine(440, 10.0, amp=0.01)
-    audio = _concat(quiet, loud, quiet2)
-    det = LoudnessChangeDetector(loudness_jump_db=8.0, min_duration_s=5.0, max_duration_s=120.0)
-    assert det.detect(audio, SAMPLE_RATE) == []
-
-
-# ---------------------------------------------------------------------------
-# SpectralDissimilarityDetector
-# ---------------------------------------------------------------------------
-
-
-def test_spectral_detector_uniform_audio() -> None:
-    """Uniform audio (same spectral content throughout) should produce no segments."""
-    audio = _sine(440, 30.0, amp=0.3)
-    det = SpectralDissimilarityDetector(
-        distance_threshold=0.15,
-        baseline_windows=5,
-        min_duration_s=3.0,
-        max_duration_s=30.0,
-    )
+def test_fingerprint_detector_no_match() -> None:
+    """Spectrally unrelated reference should not produce matches above threshold."""
+    reference = _sine(2000, 1.0)  # 2 kHz reference
+    audio = _sine(440, 10.0)  # 440 Hz audio only
+    det = FingerprintDetector(reference_clips=[reference], correlation_threshold=0.9)
     segs = det.detect(audio, SAMPLE_RATE)
     assert segs == []
 
 
-def test_spectral_detector_detects_different_tone() -> None:
-    """A long burst of spectrally different audio (white noise) should be flagged."""
-    rng = np.random.default_rng(42)
-    baseline = _sine(440, 10.0, amp=0.3)  # 440 Hz sine baseline
-    # White noise has a very different spectral envelope than a pure tone
-    burst = rng.standard_normal(10 * SAMPLE_RATE).astype(np.float32) * 0.3
-    tail = _sine(440, 10.0, amp=0.3)
-    audio = _concat(baseline, burst, tail)
-    det = SpectralDissimilarityDetector(
-        distance_threshold=0.05,
-        baseline_windows=5,
-        min_duration_s=3.0,
-        max_duration_s=30.0,
+def test_fingerprint_detector_multiple_clips() -> None:
+    """Detector should find occurrences of each reference clip independently."""
+    jingle = _sine(2000, 1.0)
+    sponsorship = _sine(3000, 1.0)
+    audio = _concat(
+        _sine(440, 3.0),
+        jingle,
+        _sine(440, 3.0),
+        sponsorship,
+        _sine(440, 3.0),
     )
+    det = FingerprintDetector(reference_clips=[jingle, sponsorship], correlation_threshold=0.9)
     segs = det.detect(audio, SAMPLE_RATE)
-    assert len(segs) >= 1
+    assert len(segs) == 2
+
+
+def test_fingerprint_detector_stereo_audio() -> None:
+    """Detector should handle stereo (2-D) audio correctly."""
+    jingle = _sine(2000, 1.0)
+    mono_audio = _concat(_sine(440, 3.0), jingle, _sine(440, 3.0))
+    stereo = np.stack([mono_audio, mono_audio], axis=1)
+    det = FingerprintDetector(reference_clips=[jingle], correlation_threshold=0.9)
+    segs = det.detect(stereo, SAMPLE_RATE)
+    assert len(segs) == 1
+
+
+def test_fingerprint_detector_empty_reference_skipped() -> None:
+    """An empty reference clip should be silently skipped."""
+    empty_ref = np.array([], dtype=np.float32)
+    audio = _sine(440, 3.0)
+    det = FingerprintDetector(reference_clips=[empty_ref], correlation_threshold=0.9)
+    segs = det.detect(audio, SAMPLE_RATE)
+    assert segs == []
 
 
 # ---------------------------------------------------------------------------
@@ -244,78 +192,101 @@ def test_spectral_detector_detects_different_tone() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_remove_ads_silence_strategy() -> None:
-    """remove_ads with silence strategy should remove a silent gap."""
-    audio = _concat(_sine(440, 1.0), _silence(2.0), _sine(440, 1.0))
+def test_remove_ads_timestamps_strategy() -> None:
+    """remove_ads with timestamps strategy should remove the specified interval."""
+    jingle = _sine(2000, 2.0)
+    audio = _concat(_sine(440, 5.0), jingle, _sine(440, 5.0))
     out = remove_ads(
         audio,
         SAMPLE_RATE,
-        strategy="silence",
-        silence_threshold_db=-45.0,
-        silence_min_duration_s=1.0,
-        silence_max_duration_s=30.0,
+        strategy="timestamps",
+        timestamps=[(5.0, 7.0)],
     )
     assert len(out) < len(audio)
+    assert abs(len(out) - 10 * SAMPLE_RATE) < SAMPLE_RATE * 0.1
 
 
-def test_remove_ads_loudness_strategy() -> None:
-    """remove_ads with loudness strategy should remove a loud burst."""
-    quiet = _sine(440, 10.0, amp=0.01)
-    loud = _sine(440, 15.0, amp=0.9)
-    quiet2 = _sine(440, 10.0, amp=0.01)
-    audio = _concat(quiet, loud, quiet2)
+def test_remove_ads_fingerprint_strategy() -> None:
+    """remove_ads with fingerprint strategy should locate and remove the ad clip."""
+    jingle = _sine(2000, 2.0)
+    audio = _concat(_sine(440, 5.0), jingle, _sine(440, 5.0))
     out = remove_ads(
         audio,
         SAMPLE_RATE,
-        strategy="loudness",
-        loudness_jump_db=8.0,
-        loudness_min_duration_s=5.0,
-        loudness_max_duration_s=120.0,
+        strategy="fingerprint",
+        reference_clips=[jingle],
+        correlation_threshold=0.9,
     )
     assert len(out) < len(audio)
 
 
 def test_remove_ads_combined_strategy() -> None:
-    """combined strategy should handle both silence and loudness."""
-    quiet = _sine(440, 5.0, amp=0.01)
-    loud = _sine(440, 10.0, amp=0.9)
-    gap = _silence(2.0)
-    quiet2 = _sine(440, 5.0, amp=0.01)
-    audio = _concat(quiet, loud, gap, quiet2)
-    out = remove_ads(audio, SAMPLE_RATE, strategy="combined")
-    assert len(out) < len(audio)
-
-
-def test_remove_ads_no_ads() -> None:
-    """When nothing is detected, the output should be identical to the input."""
-    audio = _sine(440, 3.0, amp=0.3)
-    out = remove_ads(audio, SAMPLE_RATE, strategy="silence")
-    np.testing.assert_array_equal(out, audio)
-
-
-def test_remove_ads_spectral_strategy() -> None:
-    """remove_ads with spectral strategy should remove a spectrally dissimilar burst."""
-    rng = np.random.default_rng(42)
-    baseline = _sine(440, 10.0, amp=0.3)
-    burst = rng.standard_normal(10 * SAMPLE_RATE).astype(np.float32) * 0.3
-    tail = _sine(440, 10.0, amp=0.3)
-    audio = _concat(baseline, burst, tail)
+    """combined strategy should apply both timestamps and fingerprint removal."""
+    jingle = _sine(2000, 1.0)
+    sponsorship = _sine(3000, 1.0)
+    audio = _concat(
+        _sine(440, 3.0),
+        sponsorship,
+        _sine(440, 3.0),
+        jingle,
+        _sine(440, 3.0),
+    )
     out = remove_ads(
         audio,
         SAMPLE_RATE,
-        strategy="spectral",
-        spectral_distance_threshold=0.05,
-        spectral_baseline_windows=5,
-        spectral_min_duration_s=3.0,
-        spectral_max_duration_s=30.0,
+        strategy="combined",
+        timestamps=[(3.0, 4.0)],  # remove the sponsorship read by timestamp
+        reference_clips=[jingle],  # remove the jingle by fingerprint
+        correlation_threshold=0.9,
     )
     assert len(out) < len(audio)
 
 
-def test_remove_ads_stereo_silence() -> None:
-    """remove_ads should handle stereo input."""
-    mono_gap = _concat(_sine(440, 1.0), _silence(2.0), _sine(440, 1.0))
-    stereo = np.stack([mono_gap, mono_gap], axis=1)
-    out = remove_ads(stereo, SAMPLE_RATE, strategy="silence")
+def test_remove_ads_no_segments_returns_copy() -> None:
+    """When nothing is detected, the output should be identical to the input."""
+    audio = _sine(440, 3.0, amp=0.3)
+    out = remove_ads(audio, SAMPLE_RATE, strategy="timestamps")
+    np.testing.assert_array_equal(out, audio)
+
+
+def test_remove_ads_stereo_timestamps() -> None:
+    """remove_ads should handle stereo input with timestamps."""
+    mono_audio = _concat(_sine(440, 3.0), _sine(2000, 2.0), _sine(440, 3.0))
+    stereo = np.stack([mono_audio, mono_audio], axis=1)
+    out = remove_ads(stereo, SAMPLE_RATE, strategy="timestamps", timestamps=[(3.0, 5.0)])
     assert out.ndim == 2
     assert out.shape[0] < stereo.shape[0]
+
+
+# ---------------------------------------------------------------------------
+# remove_ads — validation errors
+# ---------------------------------------------------------------------------
+
+
+def test_remove_ads_invalid_sample_rate() -> None:
+    audio = _sine(440, 1.0)
+    with pytest.raises(ValueError, match="sample_rate"):
+        remove_ads(audio, 0)
+
+
+def test_remove_ads_empty_audio() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        remove_ads(np.array([], dtype=np.float32), SAMPLE_RATE)
+
+
+def test_remove_ads_invalid_fade_ms() -> None:
+    audio = _sine(440, 1.0)
+    with pytest.raises(ValueError, match="fade_ms"):
+        remove_ads(audio, SAMPLE_RATE, fade_ms=-1.0)
+
+
+def test_remove_ads_invalid_correlation_threshold() -> None:
+    audio = _sine(440, 1.0)
+    with pytest.raises(ValueError, match="correlation_threshold"):
+        remove_ads(audio, SAMPLE_RATE, correlation_threshold=0.0)
+
+
+def test_remove_ads_timestamp_end_before_start() -> None:
+    audio = _sine(440, 5.0)
+    with pytest.raises(ValueError, match="greater than start"):
+        remove_ads(audio, SAMPLE_RATE, strategy="timestamps", timestamps=[(3.0, 1.0)])
