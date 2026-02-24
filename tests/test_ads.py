@@ -178,11 +178,11 @@ def test_fingerprint_detector_stereo_audio() -> None:
     assert len(segs) == 1
 
 
-def test_fingerprint_detector_empty_reference_skipped() -> None:
-    """An empty reference clip should be silently skipped."""
-    empty_ref = np.array([], dtype=np.float32)
-    audio = _sine(440, 3.0)
-    det = FingerprintDetector(reference_clips=[empty_ref], correlation_threshold=0.9)
+def test_fingerprint_detector_ref_longer_than_audio() -> None:
+    """A reference clip longer than the audio should be silently skipped."""
+    ref = _sine(440, 5.0)  # 5 s reference
+    audio = _sine(440, 2.0)  # 2 s audio — shorter than reference
+    det = FingerprintDetector(reference_clips=[ref], correlation_threshold=0.9)
     segs = det.detect(audio, SAMPLE_RATE)
     assert segs == []
 
@@ -242,7 +242,13 @@ def test_remove_ads_combined_strategy() -> None:
     assert len(out) < len(audio)
 
 
-def test_remove_ads_no_segments_returns_copy() -> None:
+def test_fingerprint_detector_empty_reference_skipped() -> None:
+    """An empty reference clip should be silently skipped."""
+    empty_ref = np.array([], dtype=np.float32)
+    audio = _sine(440, 3.0)
+    det = FingerprintDetector(reference_clips=[empty_ref], correlation_threshold=0.9)
+    segs = det.detect(audio, SAMPLE_RATE)
+    assert segs == []
     """When nothing is detected, the output should be identical to the input."""
     audio = _sine(440, 3.0, amp=0.3)
     out = remove_ads(audio, SAMPLE_RATE, strategy="timestamps")
@@ -283,10 +289,33 @@ def test_remove_ads_invalid_fade_ms() -> None:
 def test_remove_ads_invalid_correlation_threshold() -> None:
     audio = _sine(440, 1.0)
     with pytest.raises(ValueError, match="correlation_threshold"):
-        remove_ads(audio, SAMPLE_RATE, correlation_threshold=0.0)
+        remove_ads(audio, SAMPLE_RATE, correlation_threshold=-0.1)
+    with pytest.raises(ValueError, match="correlation_threshold"):
+        remove_ads(audio, SAMPLE_RATE, correlation_threshold=1.1)
 
 
 def test_remove_ads_timestamp_end_before_start() -> None:
     audio = _sine(440, 5.0)
     with pytest.raises(ValueError, match="greater than start"):
         remove_ads(audio, SAMPLE_RATE, strategy="timestamps", timestamps=[(3.0, 1.0)])
+
+
+def test_remove_ads_negative_timestamp_start() -> None:
+    """A negative timestamp start should raise a ValueError."""
+    audio = _sine(440, 5.0)
+    with pytest.raises(ValueError, match="timestamp start must be >= 0"):
+        remove_ads(audio, SAMPLE_RATE, strategy="timestamps", timestamps=[(-1.0, 2.0)])
+
+
+def test_remove_ads_timestamps_beyond_audio_duration() -> None:
+    """Timestamps that extend beyond the audio duration should be clamped correctly."""
+    audio = _sine(440, 3.0)  # 3 s audio
+    # end_s (10.0) is beyond the audio length; only content up to the end should be removed
+    out = remove_ads(
+        audio,
+        SAMPLE_RATE,
+        strategy="timestamps",
+        timestamps=[(2.0, 10.0)],  # remove from 2 s to end of file
+    )
+    assert len(out) < len(audio)
+    assert abs(len(out) - 2 * SAMPLE_RATE) < SAMPLE_RATE * 0.1

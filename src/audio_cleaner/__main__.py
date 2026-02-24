@@ -56,16 +56,26 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
     if args.timestamps:
         timestamps = []
         for ts in args.timestamps:
-            try:
-                start_s, end_s = ts.split(",")
-                timestamps.append((float(start_s), float(end_s)))
-            except ValueError:
+            parts = ts.split(",")
+            if len(parts) != 2:
                 print(
                     f"Error: invalid timestamp '{ts}'. "
                     "Expected format: start,end (e.g. 30.0,45.0).",
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            start_str, end_str = parts
+            try:
+                start_f = float(start_str.strip())
+                end_f = float(end_str.strip())
+            except ValueError:
+                print(
+                    f"Error: non-numeric timestamp values in '{ts}'. "
+                    "Expected numeric seconds as start,end (e.g. 30.0,45.0).",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            timestamps.append((start_f, end_f))
 
     # Load reference clips for fingerprint strategy
     reference_clips: list[AudioArray] | None = None
@@ -75,9 +85,23 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
             try:
                 clip, _ = sf.read(clip_path, dtype="float32")
                 reference_clips.append(clip)  # type: ignore[arg-type]
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError) as exc:
                 print(f"Error: could not load reference clip '{clip_path}': {exc}", file=sys.stderr)
                 sys.exit(1)
+
+    # Validate that required inputs are provided for the selected strategy
+    if strategy == "timestamps" and not timestamps:
+        print(
+            "Error: strategy 'timestamps' requires at least one --timestamps interval.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if strategy == "fingerprint" and not reference_clips:
+        print(
+            "Error: strategy 'fingerprint' requires at least one --reference-clips file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     errors: list[str] = []
     for audio_file in audio_files:

@@ -171,7 +171,8 @@ class FingerprintDetector:
 
         Args:
             audio: 1-D or 2-D float32 audio array.
-            sample_rate: Sample rate in Hz.
+            sample_rate: Sample rate in Hz.  Retained for interface consistency;
+                the correlation calculation does not depend on it.
 
         Returns:
             Sorted list of (start_sample, end_sample) matched segments.
@@ -188,18 +189,18 @@ class FingerprintDetector:
                 continue
 
             ncc = _normalized_cross_correlation(audio_f64, ref_f64)
-            # Walk through ncc and collect non-overlapping matches
-            pos = 0
             n = len(ncc)
-            while pos < n:
-                if ncc[pos] >= self.correlation_threshold:
-                    # Find the best-matching position within this window
-                    end_search = min(pos + ref_len, n)
-                    best_pos = pos + int(np.argmax(ncc[pos:end_search]))
-                    segments.append((best_pos, best_pos + ref_len))
-                    pos = best_pos + ref_len  # skip past this match
-                else:
-                    pos += 1
+            # Collect non-overlapping matches: find all candidate positions above
+            # threshold in a single vectorised pass, then greedily select them.
+            candidate_indices = np.where(ncc >= self.correlation_threshold)[0]
+            next_allowed_pos = 0
+            for idx in candidate_indices:
+                if idx < next_allowed_pos:
+                    continue  # overlaps with previous match
+                end_search = min(int(idx) + ref_len, n)
+                best_pos = int(idx) + int(np.argmax(ncc[idx:end_search]))
+                segments.append((best_pos, best_pos + ref_len))
+                next_allowed_pos = best_pos + ref_len
 
         return sorted(segments)
 
@@ -253,11 +254,14 @@ def remove_ads(
         sample_rate: Sample rate in Hz.
         strategy: Removal strategy.  One of ``"timestamps"``, ``"fingerprint"``,
             or ``"combined"``.
-        timestamps: List of ``(start_s, end_s)`` pairs (in seconds) marking segments
-            to remove.  Required when *strategy* is ``"timestamps"`` or ``"combined"``.
-        reference_clips: List of known ad/jingle audio arrays used for fingerprint
-            matching.  Required when *strategy* is ``"fingerprint"`` or
-            ``"combined"``.
+        timestamps: Optional list of ``(start_s, end_s)`` pairs (in seconds)
+            marking segments to remove.  Used when *strategy* is ``"timestamps"``
+            or ``"combined"``; if omitted or empty, no timestamp-based removal
+            is performed.
+        reference_clips: Optional list of known ad/jingle audio arrays used for
+            fingerprint matching.  Used when *strategy* is ``"fingerprint"`` or
+            ``"combined"``; if omitted or empty, no fingerprint-based removal
+            is performed.
         correlation_threshold: Minimum normalized cross-correlation score for the
             fingerprint detector to flag a match (default: 0.7).
         fade_ms: Crossfade duration at cut points in milliseconds (default: 20.0).
@@ -290,14 +294,16 @@ def remove_ads(
         raise ValueError("audio must not be empty")
     if fade_ms < 0:
         raise ValueError(f"fade_ms must be >= 0, got {fade_ms}")
-    if not (0 < correlation_threshold <= 1):
-        raise ValueError(f"correlation_threshold must be in (0, 1], got {correlation_threshold}")
+    if not (0 <= correlation_threshold <= 1):
+        raise ValueError(f"correlation_threshold must be in [0, 1], got {correlation_threshold}")
 
     segments: list[Segment] = []
 
     if strategy in ("timestamps", "combined"):
         if timestamps:
             for start_s, end_s in timestamps:
+                if start_s < 0:
+                    raise ValueError(f"timestamp start must be >= 0, got {start_s}")
                 if end_s <= start_s:
                     raise ValueError(
                         f"timestamp end ({end_s}) must be greater than start ({start_s})"
