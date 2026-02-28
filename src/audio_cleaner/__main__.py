@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
+
 from audio_cleaner import __version__
 
 _AD_STRATEGIES = ("timestamps", "fingerprint", "combined")
@@ -202,10 +204,13 @@ def _run_learn_ads(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     if args.resample_hz and args.resample_hz != sr:
-        from audio_cleaner.ads import _resample_audio  # type: ignore[attr-defined]
+        from math import gcd
 
+        from scipy.signal import resample_poly  # type: ignore[attr-defined]
+
+        g = gcd(sr, args.resample_hz)
         print(f"  Resampling from {sr} Hz to {args.resample_hz} Hz …")
-        audio = _resample_audio(audio, sr, args.resample_hz)  # type: ignore[arg-type]
+        audio = resample_poly(audio, args.resample_hz // g, sr // g).astype(np.float32)  # type: ignore[assignment]
         sr = args.resample_hz
 
     print(f"  Learning profile from {len(timestamps)} interval(s) …")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -691,7 +693,7 @@ def test_create_ad_profile_empty_audio() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_save_load_roundtrip(tmp_path: pytest.TempPathFactory) -> None:
+def test_save_load_roundtrip(tmp_path: Path) -> None:
     """Profile saved with save_ad_profile must be loadable and identical."""
     ad = _sine(2000, 2.0)
     audio = _build_audio_with_repeated_ad(ad, [5.0, 20.0], total_s=30.0)
@@ -723,7 +725,7 @@ def test_save_load_roundtrip(tmp_path: pytest.TempPathFactory) -> None:
         )
 
 
-def test_save_load_path_with_extension(tmp_path: pytest.TempPathFactory) -> None:
+def test_save_load_path_with_extension(tmp_path: Path) -> None:
     """save/load should work even when path is passed with .json extension."""
     ad = _sine(2000, 1.5)
     audio = _build_audio_with_repeated_ad(ad, [3.0], total_s=10.0)
@@ -734,7 +736,7 @@ def test_save_load_path_with_extension(tmp_path: pytest.TempPathFactory) -> None
     assert len(loaded.fingerprints) == 1
 
 
-def test_load_missing_file_raises(tmp_path: pytest.TempPathFactory) -> None:
+def test_load_missing_file_raises(tmp_path: Path) -> None:
     """Loading a non-existent profile should raise FileNotFoundError."""
     with pytest.raises(FileNotFoundError):
         load_ad_profile(tmp_path / "nonexistent")
@@ -785,7 +787,7 @@ def test_clean_with_profile_duck_preserves_length() -> None:
     assert out_rms < in_rms * 0.5
 
 
-def test_clean_with_profile_no_match_returns_copy(tmp_path: pytest.TempPathFactory) -> None:
+def test_clean_with_profile_no_match_returns_copy(tmp_path: Path) -> None:
     """When no ad is found, clean_with_profile should return a copy of the input."""
     ad = _sine(2000, 2.0)
     ref = _concat(_sine(440, 5.0), ad, _sine(440, 5.0))
@@ -902,7 +904,7 @@ def test_clean_with_profile_empty_audio() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cli_learn_and_apply(tmp_path: pytest.TempPathFactory) -> None:
+def test_cli_learn_and_apply(tmp_path: Path) -> None:
     """End-to-end: learn-ads + apply-ads-profile via Python entry-points."""
     import soundfile as sf
 
