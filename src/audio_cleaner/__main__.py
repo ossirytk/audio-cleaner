@@ -116,6 +116,10 @@ def _run_remove_ads(args: argparse.Namespace) -> None:
                 reference_clips=reference_clips,
                 correlation_threshold=args.correlation_threshold,
                 fade_ms=args.fade_ms,
+                timestamp_action=args.timestamp_action,
+                timestamp_duck_db=args.timestamp_duck_db,
+                cut_snap_ms=args.cut_snap_ms,
+                cut_match_ms=args.cut_match_ms,
             )
             # Preserve relative directory structure when input is a directory
             if is_dir_input:
@@ -142,20 +146,11 @@ def main() -> None:
     """Run the audio-cleaner CLI."""
     parser = argparse.ArgumentParser(
         prog="audio-cleaner",
-        description="Clean FLAC and WAV audio files: denoise, normalise, remove ads.",
+        description="Clean FLAC and WAV audio files: normalise and remove ads.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
-
-    # denoise sub-command (placeholder)
-    denoise_parser = subparsers.add_parser(
-        "denoise", help="Remove background noise from audio files."
-    )
-    denoise_parser.add_argument("input", help="Input audio file or directory.")
-    denoise_parser.add_argument(
-        "--output", "-o", default=".", help="Output directory (default: current dir)."
-    )
 
     # normalise sub-command (placeholder)
     normalise_parser = subparsers.add_parser(
@@ -210,9 +205,47 @@ def main() -> None:
     ads_parser.add_argument(
         "--fade-ms",
         type=float,
-        default=20.0,
+        default=60.0,
         dest="fade_ms",
-        help="Crossfade duration at cut points in ms (default: 20.0).",
+        help="Crossfade duration at cut points in ms (default: 60.0).",
+    )
+    ads_parser.add_argument(
+        "--timestamp-action",
+        choices=("replace", "duck", "remove"),
+        default="replace",
+        dest="timestamp_action",
+        help=(
+            "How to process --timestamps intervals: 'replace' keeps duration with "
+            "smooth bridging, 'duck' attenuates in-place, 'remove' cuts out "
+            "(default: replace)."
+        ),
+    )
+    ads_parser.add_argument(
+        "--timestamp-duck-db",
+        type=float,
+        default=-18.0,
+        dest="timestamp_duck_db",
+        help="Gain in dB applied when --timestamp-action duck (default: -18.0).",
+    )
+    ads_parser.add_argument(
+        "--cut-snap-ms",
+        type=float,
+        default=250.0,
+        dest="cut_snap_ms",
+        help=(
+            "Search window in ms to snap remove-mode cut boundaries to nearby "
+            "low-amplitude points (default: 250.0; set 0 to disable)."
+        ),
+    )
+    ads_parser.add_argument(
+        "--cut-match-ms",
+        type=float,
+        default=40.0,
+        dest="cut_match_ms",
+        help=(
+            "Context window in ms used to align post-cut audio with pre-cut "
+            "waveform when snapping remove boundaries (default: 40.0)."
+        ),
     )
 
     args = parser.parse_args()

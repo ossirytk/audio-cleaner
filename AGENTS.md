@@ -7,8 +7,7 @@ This file provides guidance for AI coding agents (GitHub Copilot, Cursor, etc.) 
 `audio-cleaner` is a Python library and CLI tool that processes FLAC and WAV audio files to:
 
 1. **Improve poor audio quality** — normalisation, dynamic-range compression, equalisation, de-clipping.
-2. **Remove background noise** — spectral subtraction, Wiener filtering, deep-learning denoising.
-3. **Detect and remove ads / interrupts** — silence detection, audio fingerprinting, segment classification.
+2. **Detect and remove ads / interrupts** — silence detection, audio fingerprinting, segment classification.
 
 ## Repository Layout
 
@@ -19,14 +18,11 @@ audio-cleaner/
 │       ├── __init__.py
 │       ├── __main__.py      # CLI entry-point
 │       ├── quality.py       # Audio quality improvement
-│       ├── noise.py         # Background noise removal
 │       └── ads.py           # Ad / interrupt detection & removal
 ├── tests/                   # pytest test suite
 │   └── test_*.py
 ├── docs/                    # Planning & design documents
-│   ├── plan-audio-quality.md
-│   ├── plan-noise-removal.md
-│   └── plan-ad-detection.md
+│   └── plan-audio-quality.md
 ├── pyproject.toml           # Project metadata, ruff, pyrefly, pytest config
 ├── AGENTS.md                # ← you are here
 └── README.md
@@ -92,7 +88,7 @@ Sample rate is preserved unless the user explicitly requests resampling.
 
 1. **Pure-Python first** — avoid shell-outs to `ffmpeg` or other binaries unless no Python alternative exists.
 2. **Non-destructive by default** — original files are never overwritten; outputs go to a user-specified directory.
-3. **Pipeline architecture** — cleaning steps are composable so users can chain them (e.g., denoise → normalise → remove ads).
+3. **Pipeline architecture** — cleaning steps are composable so users can chain them (e.g., normalise → remove ads).
 4. **Batch processing** — the CLI accepts a directory or glob pattern as input.
 5. **Reproducible** — all random seeds and configurable parameters are exposed via `pyproject.toml` or CLI flags.
 
@@ -102,4 +98,4 @@ Sample rate is preserved unless the user explicitly requests resampling.
 - All new code must have corresponding tests in `tests/`.
 - Run `ruff check`, `pyrefly check`, and `pytest` before opening a PR.
 - PR titles should follow Conventional Commits: `feat:`, `fix:`, `docs:`, `chore:`.
-- Reference the relevant planning document (e.g., `docs/plan-noise-removal.md`) in the PR description.
+- Reference the relevant planning document (e.g., `docs/plan-audio-quality.md`) in the PR description.

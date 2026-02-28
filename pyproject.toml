@@ -1,7 +1,7 @@
 [project]
 name = "audio-cleaner"
 version = "0.1.0"
-description = "Tools for cleaning audio files — removes noise, improves quality, and detects ads/interrupts."
+description = "Tools for cleaning audio files — improves quality and detects ads/interrupts."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,7 +9,6 @@ dependencies = [
     "scipy>=1.14",
     "soundfile>=0.12",
     "librosa>=0.10",
-    "noisereduce>=3.0",
 ]
 
 [project.optional-dependencies]

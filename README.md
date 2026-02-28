@@ -7,8 +7,7 @@ A Python toolkit for cleaning **FLAC** and **WAV** audio files.
 | Feature | Module | Plan |
 |---|---|---|
 | Loudness normalisation, de-clipping, EQ, compression | `audio_cleaner.quality` | [docs/plan-audio-quality.md](docs/plan-audio-quality.md) |
-| Background noise removal (spectral gating, Wiener, notch filters) | `audio_cleaner.noise` | [docs/plan-noise-removal.md](docs/plan-noise-removal.md) |
-| Ad / interrupt detection and removal | `audio_cleaner.ads` | [docs/plan-ad-detection.md](docs/plan-ad-detection.md) |
+| Ad / interrupt detection and removal | `audio_cleaner.ads` | Implemented |
 
 ## Quick Start
 
@@ -21,6 +20,37 @@ uv sync
 
 # Run the CLI
 uv run audio-cleaner --help
+```
+
+## Ad Removal Modes
+
+The `remove-ads` command supports non-destructive replacement, optional ducking,
+and hard cuts for timestamp-marked ad intervals.
+
+```bash
+# Default timestamp behavior: replace ad intervals with smooth bridges (preserves duration)
+uv run audio-cleaner remove-ads input.wav --output cleaned/ \
+	--strategy timestamps --timestamps 30.0,45.0
+
+# Ducking mode: lower the ad interval by 24 dB
+uv run audio-cleaner remove-ads input.wav --output cleaned/ \
+	--strategy timestamps --timestamps 30.0,45.0 \
+	--timestamp-action duck --timestamp-duck-db -24
+
+# Hard removal: physically cut timestamp intervals out
+uv run audio-cleaner remove-ads input.wav --output cleaned/ \
+	--strategy timestamps --timestamps 30.0,45.0 \
+	--timestamp-action remove
+
+# Hard removal with seam-optimized defaults (recommended)
+uv run audio-cleaner remove-ads input.wav --output cleaned/ \
+	--strategy timestamps --timestamps 30.0,45.0 \
+	--timestamp-action remove --fade-ms 60 --cut-snap-ms 250 --cut-match-ms 40
+
+# Combined mode: replace timestamp intervals and remove fingerprint matches
+uv run audio-cleaner remove-ads input.wav --output cleaned/ \
+	--strategy combined --timestamps 30.0,45.0 \
+	--reference-clips known_ad.wav
 ```
 
 ## Toolchain

@@ -8,8 +8,11 @@ import pytest
 from audio_cleaner.ads import (
     FingerprintDetector,
     _apply_crossfade,
+    _apply_ducking,
+    _apply_replacement,
     _merge_segments,
     _normalized_cross_correlation,
+    _snap_remove_boundaries,
     remove_ads,
 )
 
@@ -91,6 +94,69 @@ def test_apply_crossfade_stereo() -> None:
     out = _apply_crossfade(stereo, remove, SAMPLE_RATE, fade_ms=10.0)
     assert out.ndim == 2
     assert out.shape[1] == 2
+
+
+def test_apply_crossfade_overlap_join_avoids_deep_dip() -> None:
+    """Crossfade join should not dip close to silence for equal-level neighboring chunks."""
+    part_a = np.ones(SAMPLE_RATE, dtype=np.float32)
+    removed_mid = np.zeros(SAMPLE_RATE, dtype=np.float32)
+    part_b = np.ones(SAMPLE_RATE, dtype=np.float32)
+    audio = _concat(part_a, removed_mid, part_b)
+    out = _apply_crossfade(audio, [(SAMPLE_RATE, 2 * SAMPLE_RATE)], SAMPLE_RATE, fade_ms=50.0)
+
+    join = SAMPLE_RATE - int(0.05 * SAMPLE_RATE)
+    join_window = out[max(0, join - 20) : min(len(out), join + 20)]
+    assert float(np.min(join_window)) > 0.2
+
+
+def test_apply_ducking_preserves_length_and_reduces_level() -> None:
+    """Ducking should attenuate the marked interval without changing duration."""
+    audio = _sine(440, 3.0, amp=0.8)
+    start = int(1.0 * SAMPLE_RATE)
+    end = int(2.0 * SAMPLE_RATE)
+    out = _apply_ducking(
+        audio,
+        duck_segments=[(start, end)],
+        sample_rate=SAMPLE_RATE,
+        duck_db=-18.0,
+        fade_ms=20.0,
+    )
+    assert len(out) == len(audio)
+    in_rms = np.sqrt(np.mean(audio[start:end] ** 2))
+    out_rms = np.sqrt(np.mean(out[start:end] ** 2))
+    assert out_rms < in_rms * 0.2
+
+
+def test_apply_replacement_preserves_length_and_changes_segment() -> None:
+    """Replacement should keep duration while replacing content in marked interval."""
+    jingle = _sine(2000, 1.0)
+    audio = _concat(_sine(440, 1.0), jingle, _sine(440, 1.0))
+    start = SAMPLE_RATE
+    end = 2 * SAMPLE_RATE
+    out = _apply_replacement(audio, [(start, end)])
+    assert len(out) == len(audio)
+    assert not np.array_equal(out[start:end], audio[start:end])
+
+
+def test_snap_remove_boundaries_moves_to_low_amplitude_points() -> None:
+    """Boundary snapping should move cuts to nearby low-amplitude samples."""
+    audio = np.ones(1000, dtype=np.float32)
+    audio[420] = 0.0
+    audio[780] = 0.0
+    snapped = _snap_remove_boundaries(audio, [(400, 800)], search_samples=30, match_samples=0)
+    assert snapped == [(420, 780)]
+
+
+def test_snap_remove_boundaries_alignment_refines_end() -> None:
+    """Alignment should refine the end boundary to a better waveform match."""
+    x = np.linspace(0, 8 * np.pi, 1600, endpoint=False)
+    audio = np.sin(x).astype(np.float32)
+    # Deliberately offset end away from phase-consistent continuation.
+    snapped = _snap_remove_boundaries(audio, [(400, 710)], search_samples=40, match_samples=80)
+    start, end = snapped[0]
+    assert start >= 360
+    assert end <= 750
+    assert end != 710
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +259,7 @@ def test_fingerprint_detector_ref_longer_than_audio() -> None:
 
 
 def test_remove_ads_timestamps_strategy() -> None:
-    """remove_ads with timestamps strategy should remove the specified interval."""
+    """timestamps strategy should replace by default, preserving duration."""
     jingle = _sine(2000, 2.0)
     audio = _concat(_sine(440, 5.0), jingle, _sine(440, 5.0))
     out = remove_ads(
@@ -201,6 +267,43 @@ def test_remove_ads_timestamps_strategy() -> None:
         SAMPLE_RATE,
         strategy="timestamps",
         timestamps=[(5.0, 7.0)],
+    )
+    assert len(out) == len(audio)
+    start = int(5.0 * SAMPLE_RATE)
+    end = int(7.0 * SAMPLE_RATE)
+    assert not np.array_equal(out[start:end], audio[start:end])
+
+
+def test_remove_ads_timestamps_duck_action() -> None:
+    """timestamps strategy supports explicit ducking."""
+    jingle = _sine(2000, 2.0)
+    audio = _concat(_sine(440, 5.0), jingle, _sine(440, 5.0))
+    out = remove_ads(
+        audio,
+        SAMPLE_RATE,
+        strategy="timestamps",
+        timestamps=[(5.0, 7.0)],
+        timestamp_action="duck",
+        timestamp_duck_db=-18.0,
+    )
+    assert len(out) == len(audio)
+    start = int(5.0 * SAMPLE_RATE)
+    end = int(7.0 * SAMPLE_RATE)
+    in_rms = np.sqrt(np.mean(audio[start:end] ** 2))
+    out_rms = np.sqrt(np.mean(out[start:end] ** 2))
+    assert out_rms < in_rms * 0.2
+
+
+def test_remove_ads_timestamps_remove_action() -> None:
+    """timestamps strategy can still cut intervals when explicitly requested."""
+    jingle = _sine(2000, 2.0)
+    audio = _concat(_sine(440, 5.0), jingle, _sine(440, 5.0))
+    out = remove_ads(
+        audio,
+        SAMPLE_RATE,
+        strategy="timestamps",
+        timestamps=[(5.0, 7.0)],
+        timestamp_action="remove",
     )
     assert len(out) < len(audio)
     assert abs(len(out) - 10 * SAMPLE_RATE) < SAMPLE_RATE * 0.1
@@ -256,12 +359,12 @@ def test_fingerprint_detector_empty_reference_skipped() -> None:
 
 
 def test_remove_ads_stereo_timestamps() -> None:
-    """remove_ads should handle stereo input with timestamps."""
+    """remove_ads should handle stereo replacement with timestamps by default."""
     mono_audio = _concat(_sine(440, 3.0), _sine(2000, 2.0), _sine(440, 3.0))
     stereo = np.stack([mono_audio, mono_audio], axis=1)
     out = remove_ads(stereo, SAMPLE_RATE, strategy="timestamps", timestamps=[(3.0, 5.0)])
     assert out.ndim == 2
-    assert out.shape[0] < stereo.shape[0]
+    assert out.shape[0] == stereo.shape[0]
 
 
 # ---------------------------------------------------------------------------
@@ -308,14 +411,57 @@ def test_remove_ads_negative_timestamp_start() -> None:
 
 
 def test_remove_ads_timestamps_beyond_audio_duration() -> None:
-    """Timestamps that extend beyond the audio duration should be clamped correctly."""
+    """Out-of-range timestamps should be clamped and replaced in-place."""
     audio = _sine(440, 3.0)  # 3 s audio
-    # end_s (10.0) is beyond the audio length; only content up to the end should be removed
+    # end_s (10.0) is beyond the audio length; only content up to the end is replaced
     out = remove_ads(
         audio,
         SAMPLE_RATE,
         strategy="timestamps",
-        timestamps=[(2.0, 10.0)],  # remove from 2 s to end of file
+        timestamps=[(2.0, 10.0)],
     )
-    assert len(out) < len(audio)
-    assert abs(len(out) - 2 * SAMPLE_RATE) < SAMPLE_RATE * 0.1
+    assert len(out) == len(audio)
+    start = int(2.0 * SAMPLE_RATE)
+    assert not np.array_equal(out[start:], audio[start:])
+
+
+def test_remove_ads_duck_action_rejects_positive_db() -> None:
+    """Positive duck dB should be rejected to avoid accidental ad boosting."""
+    audio = _sine(440, 3.0)
+    with pytest.raises(ValueError, match="timestamp_duck_db"):
+        remove_ads(
+            audio,
+            SAMPLE_RATE,
+            strategy="timestamps",
+            timestamps=[(1.0, 2.0)],
+            timestamp_action="duck",
+            timestamp_duck_db=6.0,
+        )
+
+
+def test_remove_ads_invalid_cut_snap_ms() -> None:
+    """Negative cut_snap_ms should be rejected."""
+    audio = _sine(440, 3.0)
+    with pytest.raises(ValueError, match="cut_snap_ms"):
+        remove_ads(
+            audio,
+            SAMPLE_RATE,
+            strategy="timestamps",
+            timestamps=[(1.0, 2.0)],
+            timestamp_action="remove",
+            cut_snap_ms=-10.0,
+        )
+
+
+def test_remove_ads_invalid_cut_match_ms() -> None:
+    """Negative cut_match_ms should be rejected."""
+    audio = _sine(440, 3.0)
+    with pytest.raises(ValueError, match="cut_match_ms"):
+        remove_ads(
+            audio,
+            SAMPLE_RATE,
+            strategy="timestamps",
+            timestamps=[(1.0, 2.0)],
+            timestamp_action="remove",
+            cut_match_ms=-5.0,
+        )
