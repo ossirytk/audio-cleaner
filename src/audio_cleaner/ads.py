@@ -8,12 +8,16 @@ Methods
 -------
 - Timestamp-based removal: user provides (start_s, end_s) intervals to remove.
 - Fingerprint-based detection: normalized cross-correlation against reference clips.
+- Profile learning: learn fingerprints from rough timestamps on a source file.
+- Profile application: detect and clean ad breaks in new files using a saved profile.
 - Clean segment reassembly with raised-cosine crossfade.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -397,26 +401,141 @@ class FingerprintDetector:
 
 
 # ---------------------------------------------------------------------------
+# Ad profile helpers
+# ---------------------------------------------------------------------------
+
+
+def _rms_normalize(audio: AudioArray) -> AudioArray:
+    """Return *audio* scaled so its RMS equals 1.0.
+
+    Args:
+        audio: 1-D float32 audio array.
+
+    Returns:
+        RMS-normalized float32 array, or a copy of *audio* if it is silent.
+    """
+    rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
+    if rms < 1e-10:
+        return audio.copy()
+    return (audio / rms).astype(np.float32)
+
+
+def _compute_spectral_signature(
+    template: AudioArray,
+    sample_rate: int,
+    n_bins: int = 32,
+) -> npt.NDArray[np.float32]:
+    """Compute a compact log-power spectral signature for *template*.
+
+    Uses a short-time Fourier transform, averages the magnitude spectrum over
+    time, then compresses the result into *n_bins* log-power values.
+
+    Args:
+        template: 1-D float32 audio clip (mono).
+        sample_rate: Sample rate in Hz (used to size the FFT window).
+        n_bins: Number of output frequency bins (default: 32).
+
+    Returns:
+        1-D float32 array of length *n_bins* containing the log-power signature.
+    """
+    from scipy.signal import stft  # type: ignore[attr-defined]
+
+    nperseg = min(512, max(8, len(template) // 4))
+    if len(template) < nperseg:
+        return np.zeros(n_bins, dtype=np.float32)
+
+    _, _, zxx = stft(template.astype(np.float64), fs=sample_rate, nperseg=nperseg)
+    mean_mag = np.abs(zxx).mean(axis=1)  # average over time → shape (n_freq,)
+
+    n_freq = len(mean_mag)
+    if n_freq >= n_bins:
+        bin_size = n_freq // n_bins
+        sig = np.array(
+            [mean_mag[i * bin_size : (i + 1) * bin_size].mean() for i in range(n_bins)],
+            dtype=np.float64,
+        )
+    else:
+        # Fewer STFT bins than requested output bins: pad with zeros
+        sig = np.zeros(n_bins, dtype=np.float64)
+        sig[:n_freq] = mean_mag
+    return np.log1p(sig).astype(np.float32)
+
+
+def _spectral_similarity(
+    audio: AudioArray,
+    reference_sig: npt.NDArray[np.float32],
+    sample_rate: int,
+) -> float:
+    """Cosine similarity between the spectral signature of *audio* and *reference_sig*.
+
+    Args:
+        audio: 1-D float32 audio clip (mono).
+        reference_sig: Pre-computed spectral signature from a fingerprint.
+        sample_rate: Sample rate in Hz.
+
+    Returns:
+        Cosine similarity in [-1, 1]; 0 if either signal is silent.
+    """
+    sig = _compute_spectral_signature(audio, sample_rate, n_bins=len(reference_sig))
+    norm_a = float(np.linalg.norm(sig))
+    norm_b = float(np.linalg.norm(reference_sig))
+    if norm_a < 1e-10 or norm_b < 1e-10:
+        return 0.0
+    return float(
+        np.dot(sig.astype(np.float64), reference_sig.astype(np.float64)) / (norm_a * norm_b)
+    )
+
+
+def _resample_audio(audio: AudioArray, src_sr: int, dst_sr: int) -> AudioArray:
+    """Resample *audio* from *src_sr* to *dst_sr*.
+
+    Args:
+        audio: 1-D float32 audio array.
+        src_sr: Source sample rate in Hz.
+        dst_sr: Target sample rate in Hz.
+
+    Returns:
+        Resampled float32 array, or the original if rates are equal.
+    """
+    if src_sr == dst_sr:
+        return audio
+    from math import gcd
+
+    from scipy.signal import resample_poly  # type: ignore[attr-defined]
+
+    g = gcd(src_sr, dst_sr)
+    return resample_poly(audio, dst_sr // g, src_sr // g).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
-def _merge_segments(segments: list[Segment]) -> list[Segment]:
+def _merge_segments(segments: list[Segment], gap_samples: int = 0) -> list[Segment]:
     """Merge overlapping or adjacent segments into minimal non-overlapping intervals.
 
     Args:
         segments: List of (start, end) sample pairs.
+        gap_samples: If > 0, segments whose gap is smaller than this value are also
+            merged (default: 0 — only overlapping/adjacent segments are merged).
+            Must be >= 0.
 
     Returns:
         Sorted, non-overlapping list of (start, end) pairs.
+
+    Raises:
+        ValueError: If *gap_samples* is negative.
     """
+    if gap_samples < 0:
+        raise ValueError(f"gap_samples must be >= 0, got {gap_samples}")
     if not segments:
         return []
     sorted_segs = sorted(segments)
     merged: list[Segment] = [sorted_segs[0]]
     for start, end in sorted_segs[1:]:
         prev_start, prev_end = merged[-1]
-        if start <= prev_end:
+        if start <= prev_end + gap_samples:
             merged[-1] = (prev_start, max(prev_end, end))
         else:
             merged.append((start, end))
@@ -577,3 +696,481 @@ def remove_ads(
         match_samples = int(sample_rate * cut_match_ms / 1000.0)
         merged = _snap_remove_boundaries(working_audio, merged, snap_samples, match_samples)
     return _apply_crossfade(working_audio, merged, sample_rate, fade_ms=fade_ms)
+
+
+# ---------------------------------------------------------------------------
+# Ad profile data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AdFingerprint:
+    """A single ad fingerprint learned from one interval of raw audio.
+
+    Attributes:
+        id: Unique identifier for this fingerprint (e.g. ``"ad_01"``).
+        duration_s: Duration of the learned clip in seconds.
+        template: RMS-normalized mono float32 time-domain template.
+        spectral_signature: Compact log-power spectral vector (float32).
+        ncc_threshold: Minimum NCC score required to accept a detection.
+        spec_threshold: Minimum spectral cosine similarity required.
+        confidence: Quality estimate in [0, 1]; lower means less reliable.
+    """
+
+    id: str
+    duration_s: float
+    template: AudioArray
+    spectral_signature: npt.NDArray[np.float32]
+    ncc_threshold: float
+    spec_threshold: float
+    confidence: float
+
+
+@dataclass
+class AdProfile:
+    """Reusable ad-break profile learned from a source recording.
+
+    Attributes:
+        profile_version: Schema version number (currently 1).
+        sample_rate: Sample rate in Hz at which fingerprints were extracted.
+        created_from: Source file name or path used during learning.
+        fingerprints: List of individual ad fingerprints.
+        snap_ms: Boundary search window in ms used during learning.
+        match_ms: Context window in ms used for end-boundary alignment.
+    """
+
+    profile_version: int
+    sample_rate: int
+    created_from: str
+    fingerprints: list[AdFingerprint] = field(default_factory=list)
+    snap_ms: float = 250.0
+    match_ms: float = 40.0
+
+
+# ---------------------------------------------------------------------------
+# Profile creation
+# ---------------------------------------------------------------------------
+
+_MIN_FINGERPRINT_DURATION_S = 0.5
+_NCC_THRESHOLD_FLOOR = 0.65
+_NCC_THRESHOLD_DEFAULT = 0.70
+_SPEC_THRESHOLD_DEFAULT = 0.65
+_NCC_CALIBRATION_SCALE = 0.90  # conservative: threshold = min_pairwise * this
+
+
+def create_ad_profile(
+    audio: AudioArray,
+    sample_rate: int,
+    rough_timestamps: list[tuple[float, float]],
+    *,
+    snap_ms: float = 250.0,
+    match_ms: float = 40.0,
+    created_from: str = "",
+) -> AdProfile:
+    """Learn an ad fingerprint profile from a source recording and rough timestamps.
+
+    For each supplied rough interval the boundaries are refined using low-energy
+    snapping (reusing :func:`_snap_remove_boundaries`), the clip is RMS-normalised,
+    and compact time-domain + spectral fingerprints are built.  NCC thresholds are
+    calibrated from pairwise similarities so the detector adapts to the actual
+    profile evidence rather than relying on hard global constants.
+
+    Args:
+        audio: 1-D (mono) or 2-D (samples x channels) float32 source audio.
+        sample_rate: Sample rate of *audio* in Hz.
+        rough_timestamps: List of ``(start_s, end_s)`` rough ad intervals in seconds.
+        snap_ms: Boundary search window in ms for low-energy snapping (default: 250).
+        match_ms: Context window in ms for end-boundary alignment (default: 40).
+        created_from: Optional label stored in the profile metadata (e.g. file name).
+
+    Returns:
+        :class:`AdProfile` containing one :class:`AdFingerprint` per valid interval.
+
+    Raises:
+        ValueError: If *sample_rate* is not positive or *audio* is empty.
+
+    Example::
+
+        import soundfile as sf
+        from audio_cleaner.ads import create_ad_profile, save_ad_profile
+
+        audio, sr = sf.read("podcast.flac", dtype="float32")
+        profile = create_ad_profile(
+            audio, sr,
+            rough_timestamps=[(102.0, 106.0), (181.0, 185.0)],
+            created_from="podcast.flac",
+        )
+        save_ad_profile(profile, "ad_profile")
+    """
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    if audio.shape[0] == 0:
+        raise ValueError("audio must not be empty")
+
+    mono = audio if audio.ndim == 1 else audio.mean(axis=1).astype(np.float32)
+    total = len(mono)
+
+    # Convert timestamps → sample indices
+    raw_segments: list[Segment] = []
+    for start_s, end_s in rough_timestamps:
+        s = max(0, int(start_s * sample_rate))
+        e = min(total, int(end_s * sample_rate))
+        if e > s:
+            raw_segments.append((s, e))
+
+    # Snap boundaries to low-energy points
+    if raw_segments and snap_ms > 0:
+        snap_samples = int(sample_rate * snap_ms / 1000.0)
+        match_samples = int(sample_rate * match_ms / 1000.0)
+        raw_segments = _snap_remove_boundaries(mono, raw_segments, snap_samples, match_samples)
+
+    # Extract and RMS-normalise clips; skip clips below minimum duration
+    clips: list[tuple[AudioArray, float]] = []  # (template, duration_s)
+    for s, e in raw_segments:
+        clip = mono[s:e].copy()
+        dur_s = len(clip) / sample_rate
+        if dur_s < _MIN_FINGERPRINT_DURATION_S:
+            continue
+        clips.append((_rms_normalize(clip), dur_s))
+
+    # Calibrate NCC threshold from pairwise similarities (few-shot adaptation)
+    templates = [c for c, _ in clips]
+    pairwise_scores: list[float] = []
+    for i in range(len(templates)):
+        for j in range(i + 1, len(templates)):
+            ref, tgt = templates[j], templates[i]
+            if len(ref) > len(tgt):
+                ref, tgt = tgt, ref
+            ncc_vals = _normalized_cross_correlation(
+                tgt.astype(np.float64), ref.astype(np.float64)
+            )
+            if len(ncc_vals) > 0:
+                pairwise_scores.append(float(ncc_vals.max()))
+
+    if pairwise_scores:
+        ncc_threshold = max(
+            _NCC_THRESHOLD_FLOOR, float(np.min(pairwise_scores)) * _NCC_CALIBRATION_SCALE
+        )
+    else:
+        ncc_threshold = _NCC_THRESHOLD_DEFAULT
+
+    # Build fingerprints
+    fingerprints: list[AdFingerprint] = []
+    for i, (tmpl, dur_s) in enumerate(clips):
+        spec_sig = _compute_spectral_signature(tmpl, sample_rate)
+        fingerprints.append(
+            AdFingerprint(
+                id=f"ad_{i + 1:02d}",
+                duration_s=dur_s,
+                template=tmpl,
+                spectral_signature=spec_sig,
+                ncc_threshold=ncc_threshold,
+                spec_threshold=_SPEC_THRESHOLD_DEFAULT,
+                confidence=1.0,
+            )
+        )
+
+    return AdProfile(
+        profile_version=1,
+        sample_rate=sample_rate,
+        created_from=created_from,
+        fingerprints=fingerprints,
+        snap_ms=snap_ms,
+        match_ms=match_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Profile persistence
+# ---------------------------------------------------------------------------
+
+
+def save_ad_profile(profile: AdProfile, path: str | Path) -> None:
+    """Save an ad profile to disk as a JSON metadata file and an NPZ array file.
+
+    Two files are written next to each other:
+
+    - ``<base>.json`` — human-readable profile metadata.
+    - ``<base>.npz`` — numeric arrays (templates and spectral signatures).
+
+    Args:
+        profile: :class:`AdProfile` to save.
+        path: Base path (with or without extension).  The ``.json`` and ``.npz``
+            suffixes are always appended regardless of what is provided.
+
+    Example::
+
+        save_ad_profile(profile, "/data/profiles/ad_profile")
+        # writes /data/profiles/ad_profile.json + /data/profiles/ad_profile.npz
+    """
+    base = Path(path).with_suffix("")
+    base.parent.mkdir(parents=True, exist_ok=True)
+
+    fp_meta = [
+        {
+            "id": fp.id,
+            "duration_s": fp.duration_s,
+            "ncc_threshold": fp.ncc_threshold,
+            "spec_threshold": fp.spec_threshold,
+            "confidence": fp.confidence,
+        }
+        for fp in profile.fingerprints
+    ]
+    metadata = {
+        "profile_version": profile.profile_version,
+        "sample_rate": profile.sample_rate,
+        "created_from": profile.created_from,
+        "fingerprints": fp_meta,
+        "refinement": {
+            "snap_ms": profile.snap_ms,
+            "match_ms": profile.match_ms,
+        },
+    }
+    base.with_suffix(".json").write_text(json.dumps(metadata, indent=2))
+
+    arrays: dict[str, npt.NDArray[np.float32] | npt.NDArray[np.float64]] = {}
+    for fp in profile.fingerprints:
+        arrays[f"template_{fp.id}"] = fp.template
+        arrays[f"spec_{fp.id}"] = fp.spectral_signature
+    np.savez(str(base.with_suffix(".npz")), **arrays)  # type: ignore[call-overload]
+
+
+def load_ad_profile(path: str | Path) -> AdProfile:
+    """Load an ad profile previously saved with :func:`save_ad_profile`.
+
+    Reads ``<base>.json`` and ``<base>.npz`` (the ``.json`` or ``.npz`` extension
+    is stripped from *path* so callers may pass either form or the bare base path).
+
+    Args:
+        path: Path to the profile (base path, ``.json``, or ``.npz`` variant).
+
+    Returns:
+        Loaded :class:`AdProfile`.
+
+    Raises:
+        FileNotFoundError: If the JSON or NPZ file does not exist.
+
+    Example::
+
+        profile = load_ad_profile("/data/profiles/ad_profile")
+    """
+    base = Path(path).with_suffix("")
+    json_path = base.with_suffix(".json")
+    npz_path = base.with_suffix(".npz")
+
+    if not json_path.exists():
+        raise FileNotFoundError(f"Profile JSON not found: {json_path}")
+    if not npz_path.exists():
+        raise FileNotFoundError(f"Profile NPZ not found: {npz_path}")
+
+    with json_path.open() as fh:
+        metadata = json.load(fh)
+
+    with np.load(str(npz_path)) as arrays:
+        refinement = metadata.get("refinement", {})
+
+        fingerprints: list[AdFingerprint] = []
+        for fp_meta in metadata["fingerprints"]:
+            fp_id = fp_meta["id"]
+            fingerprints.append(
+                AdFingerprint(
+                    id=fp_id,
+                    duration_s=float(fp_meta["duration_s"]),
+                    template=arrays[f"template_{fp_id}"].astype(np.float32),
+                    spectral_signature=arrays[f"spec_{fp_id}"].astype(np.float32),
+                    ncc_threshold=float(fp_meta["ncc_threshold"]),
+                    spec_threshold=float(fp_meta["spec_threshold"]),
+                    confidence=float(fp_meta["confidence"]),
+                )
+            )
+
+    return AdProfile(
+        profile_version=int(metadata["profile_version"]),
+        sample_rate=int(metadata["sample_rate"]),
+        created_from=str(metadata["created_from"]),
+        fingerprints=fingerprints,
+        snap_ms=float(refinement.get("snap_ms", 250.0)),
+        match_ms=float(refinement.get("match_ms", 40.0)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Profile application
+# ---------------------------------------------------------------------------
+
+_W_TIME = 0.7  # weight for NCC score in fused detection score
+_W_SPEC = 0.3  # weight for spectral score in fused detection score
+_MERGE_GAP_MS = 100.0  # gaps smaller than this are merged (ms)
+
+
+def clean_with_profile(
+    audio: AudioArray,
+    sample_rate: int,
+    profile: AdProfile,
+    *,
+    action: Literal["remove", "replace", "duck"] = "remove",
+    fade_ms: float = 60.0,
+    duck_db: float = -18.0,
+) -> AudioArray:
+    """Detect and clean ad segments in *audio* using a saved fingerprint profile.
+
+    Multi-template NCC matching is used: every fingerprint in the profile votes
+    on candidate locations.  A spectral second pass filters out false positives
+    where the waveform correlation is high but the frequency content differs.
+    Overlapping or near-adjacent detections (within 100 ms) are merged before
+    the selected cleanup action is applied.
+
+    If *sample_rate* differs from ``profile.sample_rate`` the audio is
+    transparently resampled for detection and the discovered segments are
+    mapped back to the original sample rate.
+
+    Args:
+        audio: 1-D (mono) or 2-D (samples x channels) float32 audio array.
+        sample_rate: Sample rate of *audio* in Hz.
+        profile: Loaded :class:`AdProfile` with fingerprints to match against.
+        action: How to handle detected segments.  ``"remove"`` cuts them out
+            with crossfade; ``"replace"`` replaces with smooth bridges;
+            ``"duck"`` attenuates in-place (default: ``"remove"``).
+        fade_ms: Crossfade/fade ramp duration in ms used by ``"remove"`` and
+            ``"duck"`` (default: 60.0).
+        duck_db: Gain in dB applied when *action* is ``"duck"`` (must be ≤ 0;
+            default: -18.0).
+
+    Returns:
+        Float32 audio array with detected ad segments processed according to
+        *action*.  The shape matches the input for ``"replace"``/``"duck"``,
+        and is shorter for ``"remove"``.
+
+    Raises:
+        ValueError: If *sample_rate* is not positive, *audio* is empty, or
+            *action* is unknown.
+
+    Example::
+
+        import soundfile as sf
+        from audio_cleaner.ads import clean_with_profile, load_ad_profile
+
+        profile = load_ad_profile("ad_profile")
+        audio, sr = sf.read("podcast_new.flac", dtype="float32")
+        cleaned = clean_with_profile(audio, sr, profile, action="remove")
+        sf.write("podcast_new_cleaned.flac", cleaned, sr)
+    """
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    if audio.shape[0] == 0:
+        raise ValueError("audio must not be empty")
+    if action not in ("remove", "replace", "duck"):
+        raise ValueError(f"action must be 'remove', 'replace', or 'duck', got {action!r}")
+    if action == "duck" and duck_db > 0:
+        raise ValueError(f"duck_db must be <= 0 when action='duck', got {duck_db}")
+    if fade_ms < 0:
+        raise ValueError(f"fade_ms must be >= 0, got {fade_ms}")
+
+    mono = audio if audio.ndim == 1 else audio.mean(axis=1).astype(np.float32)
+
+    # Resample for detection if necessary
+    if sample_rate != profile.sample_rate:
+        detect_audio = _resample_audio(mono, sample_rate, profile.sample_rate)
+        detect_sr = profile.sample_rate
+    else:
+        detect_audio = mono
+        detect_sr = sample_rate
+
+    detect_f64 = detect_audio.astype(np.float64)
+    n_detect = len(detect_audio)
+    gap_samples_detect = int(detect_sr * _MERGE_GAP_MS / 1000.0)
+
+    all_segments: list[Segment] = []
+    n_expected = len(profile.fingerprints)
+
+    for fp in profile.fingerprints:
+        if fp.confidence <= 0:
+            continue
+
+        tmpl_f64 = fp.template.astype(np.float64)
+        ref_len = len(tmpl_f64)
+        if ref_len == 0 or ref_len > n_detect:
+            continue
+
+        ncc = _normalized_cross_correlation(detect_f64, tmpl_f64)
+
+        combined_threshold = _W_TIME * fp.ncc_threshold + _W_SPEC * fp.spec_threshold
+
+        candidate_indices = np.where(ncc >= fp.ncc_threshold)[0]
+        next_allowed = 0
+        for idx in candidate_indices:
+            if idx < next_allowed:
+                continue
+            end_search = min(int(idx) + ref_len, len(ncc))
+            best_pos = int(idx) + int(np.argmax(ncc[idx:end_search]))
+            ncc_score = float(ncc[best_pos])
+
+            # Spectral confirmation
+            seg_end = min(best_pos + ref_len, n_detect)
+            candidate_clip = detect_audio[best_pos:seg_end]
+            if len(candidate_clip) >= ref_len // 2:
+                spec_score = _spectral_similarity(
+                    candidate_clip, fp.spectral_signature, detect_sr
+                )
+            else:
+                spec_score = 0.0
+
+            final_score = _W_TIME * ncc_score + _W_SPEC * spec_score
+            if final_score >= combined_threshold:
+                all_segments.append((best_pos, best_pos + ref_len))
+
+            next_allowed = best_pos + ref_len
+
+    if not all_segments:
+        if n_expected > 0:
+            import warnings
+
+            warnings.warn(
+                f"clean_with_profile: no ad segments detected; "
+                f"expected up to {n_expected} based on profile fingerprints.",
+                stacklevel=2,
+            )
+        return audio.copy()
+
+    # Warn if significantly fewer detections than expected
+    merged_detect = _merge_segments(all_segments, gap_samples_detect)
+    if len(merged_detect) < n_expected:
+        import warnings
+
+        warnings.warn(
+            f"clean_with_profile: detected {len(merged_detect)} segment(s) but profile "
+            f"has {n_expected} fingerprint(s); some ad breaks may have been missed.",
+            stacklevel=2,
+        )
+
+    # Map segment indices back to original sample rate if we resampled
+    if sample_rate != profile.sample_rate:
+        scale = sample_rate / profile.sample_rate
+        merged_detect = [
+            (int(s * scale), int(e * scale)) for s, e in merged_detect
+        ]
+        gap_samples_orig = int(sample_rate * _MERGE_GAP_MS / 1000.0)
+        merged_detect = _merge_segments(merged_detect, gap_samples_orig)
+
+    # Clamp to audio bounds
+    total_orig = audio.shape[0]
+    merged_detect = [
+        (max(0, s), min(total_orig, e)) for s, e in merged_detect if s < total_orig
+    ]
+    merged_detect = [(s, e) for s, e in merged_detect if e > s]
+
+    if not merged_detect:
+        return audio.copy()
+
+    if action == "remove":
+        snap_samples = int(sample_rate * profile.snap_ms / 1000.0)
+        match_samples = int(sample_rate * profile.match_ms / 1000.0)
+        if snap_samples > 0:
+            merged_detect = _snap_remove_boundaries(
+                audio, merged_detect, snap_samples, match_samples
+            )
+        return _apply_crossfade(audio, merged_detect, sample_rate, fade_ms=fade_ms)
+    if action == "replace":
+        return _apply_replacement(audio, merged_detect)
+    # action == "duck"
+    return _apply_ducking(audio, merged_detect, sample_rate, duck_db=duck_db, fade_ms=fade_ms)

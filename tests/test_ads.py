@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -10,10 +12,18 @@ from audio_cleaner.ads import (
     _apply_crossfade,
     _apply_ducking,
     _apply_replacement,
+    _compute_spectral_signature,
     _merge_segments,
     _normalized_cross_correlation,
+    _resample_audio,
+    _rms_normalize,
     _snap_remove_boundaries,
+    _spectral_similarity,
+    clean_with_profile,
+    create_ad_profile,
+    load_ad_profile,
     remove_ads,
+    save_ad_profile,
 )
 
 SAMPLE_RATE = 16000  # 16 kHz — fast enough for tests
@@ -465,3 +475,489 @@ def test_remove_ads_invalid_cut_match_ms() -> None:
             timestamp_action="remove",
             cut_match_ms=-5.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# _merge_segments — gap_samples parameter
+# ---------------------------------------------------------------------------
+
+
+def test_merge_segments_with_gap_merges_nearby() -> None:
+    """Segments within gap_samples of each other should be merged."""
+    segs = [(0, 100), (150, 250)]
+    # gap = 50 samples, gap_samples = 60 → should merge
+    merged = _merge_segments(segs, gap_samples=60)
+    assert merged == [(0, 250)]
+
+
+def test_merge_segments_with_gap_keeps_far_apart() -> None:
+    """Segments farther apart than gap_samples should remain separate."""
+    segs = [(0, 100), (300, 400)]
+    merged = _merge_segments(segs, gap_samples=50)
+    assert merged == segs
+
+
+def test_merge_segments_zero_gap_unchanged() -> None:
+    """gap_samples=0 should behave identically to the original implementation."""
+    segs = [(0, 100), (101, 200)]
+    # gap = 1 sample; with gap_samples=0 they should NOT merge
+    assert _merge_segments(segs, gap_samples=0) == segs
+
+
+# ---------------------------------------------------------------------------
+# _rms_normalize
+# ---------------------------------------------------------------------------
+
+
+def test_rms_normalize_unit_rms() -> None:
+    """Normalized audio should have RMS ≈ 1."""
+    audio = _sine(440, 1.0, amp=0.3)
+    out = _rms_normalize(audio)
+    rms = float(np.sqrt(np.mean(out.astype(np.float64) ** 2)))
+    assert rms == pytest.approx(1.0, abs=1e-5)
+
+
+def test_rms_normalize_silent_unchanged() -> None:
+    """A silent clip should be returned as-is (no divide-by-zero)."""
+    audio = np.zeros(1000, dtype=np.float32)
+    out = _rms_normalize(audio)
+    np.testing.assert_array_equal(out, audio)
+
+
+# ---------------------------------------------------------------------------
+# _compute_spectral_signature
+# ---------------------------------------------------------------------------
+
+
+def test_spectral_signature_shape() -> None:
+    """Spectral signature should have the requested number of bins."""
+    audio = _sine(1000, 1.0)
+    sig = _compute_spectral_signature(audio, SAMPLE_RATE, n_bins=32)
+    assert sig.shape == (32,)
+    assert sig.dtype == np.float32
+
+
+def test_spectral_signature_short_clip_returns_zeros() -> None:
+    """A clip shorter than the FFT window should return zeros."""
+    audio = np.zeros(4, dtype=np.float32)
+    sig = _compute_spectral_signature(audio, SAMPLE_RATE, n_bins=32)
+    assert sig.shape == (32,)
+    assert np.all(sig == 0.0)
+
+
+def test_spectral_signature_different_tones_differ() -> None:
+    """Spectral signatures for different tones should not be identical."""
+    sig_low = _compute_spectral_signature(_sine(200, 1.0), SAMPLE_RATE, n_bins=32)
+    sig_high = _compute_spectral_signature(_sine(4000, 1.0), SAMPLE_RATE, n_bins=32)
+    assert not np.allclose(sig_low, sig_high)
+
+
+# ---------------------------------------------------------------------------
+# _spectral_similarity
+# ---------------------------------------------------------------------------
+
+
+def test_spectral_similarity_same_clip_high() -> None:
+    """Spectral similarity of a clip with itself should be ~1.0."""
+    audio = _sine(1000, 1.0)
+    sig = _compute_spectral_signature(audio, SAMPLE_RATE)
+    score = _spectral_similarity(audio, sig, SAMPLE_RATE)
+    assert score == pytest.approx(1.0, abs=0.05)
+
+
+def test_spectral_similarity_different_clips_lower() -> None:
+    """Spectral similarity between very different tones should be less than 1.0."""
+    clip_a = _sine(440, 1.0)
+    clip_b = _sine(4000, 1.0)
+    sig_a = _compute_spectral_signature(clip_a, SAMPLE_RATE)
+    score = _spectral_similarity(clip_b, sig_a, SAMPLE_RATE)
+    assert score < 0.9
+
+
+# ---------------------------------------------------------------------------
+# _resample_audio
+# ---------------------------------------------------------------------------
+
+
+def test_resample_audio_same_rate_returns_original() -> None:
+    """Resampling to the same rate should return the original array."""
+    audio = _sine(440, 1.0)
+    out = _resample_audio(audio, SAMPLE_RATE, SAMPLE_RATE)
+    np.testing.assert_array_equal(out, audio)
+
+
+def test_resample_audio_changes_length() -> None:
+    """Resampling to a different rate should change the array length."""
+    audio = _sine(440, 1.0, sr=SAMPLE_RATE)
+    target_sr = 8000
+    out = _resample_audio(audio, SAMPLE_RATE, target_sr)
+    expected_len = int(len(audio) * target_sr / SAMPLE_RATE)
+    assert abs(len(out) - expected_len) <= 2  # allow rounding differences
+
+
+# ---------------------------------------------------------------------------
+# create_ad_profile
+# ---------------------------------------------------------------------------
+
+
+def _build_audio_with_repeated_ad(
+    ad_clip: np.ndarray,
+    ad_start_times_s: list[float],
+    total_s: float,
+    sr: int = SAMPLE_RATE,
+) -> np.ndarray:
+    """Build a synthetic recording with *ad_clip* inserted at given start times."""
+    audio = _sine(440, total_s, sr=sr)
+    for t in ad_start_times_s:
+        s = int(t * sr)
+        e = min(len(audio), s + len(ad_clip))
+        audio[s:e] = ad_clip[: e - s]
+    return audio
+
+
+def test_create_ad_profile_basic() -> None:
+    """create_ad_profile should produce one fingerprint per valid interval."""
+    ad = _sine(2000, 2.0)  # 2-second ad at 2 kHz
+    audio = _build_audio_with_repeated_ad(ad, [10.0, 30.0, 50.0, 70.0], total_s=90.0)
+    profile = create_ad_profile(
+        audio,
+        SAMPLE_RATE,
+        rough_timestamps=[(10.0, 12.0), (30.0, 32.0), (50.0, 52.0), (70.0, 72.0)],
+        created_from="test.flac",
+    )
+    assert len(profile.fingerprints) == 4
+    assert profile.sample_rate == SAMPLE_RATE
+    assert profile.created_from == "test.flac"
+    assert profile.profile_version == 1
+
+
+def test_create_ad_profile_duration_stored() -> None:
+    """Fingerprint duration should match the extracted clip length."""
+    ad = _sine(2000, 2.0)
+    audio = _build_audio_with_repeated_ad(ad, [5.0], total_s=20.0)
+    profile = create_ad_profile(audio, SAMPLE_RATE, rough_timestamps=[(5.0, 7.0)])
+    fp = profile.fingerprints[0]
+    assert fp.duration_s == pytest.approx(2.0, abs=0.1)
+
+
+def test_create_ad_profile_skips_short_clips() -> None:
+    """Intervals shorter than 0.5 s should produce no fingerprint."""
+    audio = _sine(440, 10.0)
+    profile = create_ad_profile(
+        audio,
+        SAMPLE_RATE,
+        rough_timestamps=[(2.0, 2.3)],  # only 0.3 s — below minimum
+    )
+    assert len(profile.fingerprints) == 0
+
+
+def test_create_ad_profile_threshold_calibrated() -> None:
+    """NCC threshold should be calibrated from pairwise similarities (≥ floor)."""
+    ad = _sine(2000, 2.0)
+    audio = _build_audio_with_repeated_ad(ad, [5.0, 20.0, 35.0, 50.0], total_s=60.0)
+    profile = create_ad_profile(
+        audio,
+        SAMPLE_RATE,
+        rough_timestamps=[(5.0, 7.0), (20.0, 22.0), (35.0, 37.0), (50.0, 52.0)],
+    )
+    for fp in profile.fingerprints:
+        assert fp.ncc_threshold >= 0.65  # floor
+
+
+def test_create_ad_profile_stereo_input() -> None:
+    """create_ad_profile should accept 2-D (stereo) audio."""
+    mono = _sine(440, 10.0)
+    ad_mono = _sine(2000, 1.0)
+    s = int(3.0 * SAMPLE_RATE)
+    mono[s : s + len(ad_mono)] = ad_mono
+    stereo = np.stack([mono, mono], axis=1)
+    profile = create_ad_profile(stereo, SAMPLE_RATE, rough_timestamps=[(3.0, 4.0)])
+    assert len(profile.fingerprints) == 1
+
+
+def test_create_ad_profile_invalid_sample_rate() -> None:
+    """Negative sample rate should raise ValueError."""
+    audio = _sine(440, 1.0)
+    with pytest.raises(ValueError, match="sample_rate"):
+        create_ad_profile(audio, -1, rough_timestamps=[(0.0, 0.5)])
+
+
+def test_create_ad_profile_empty_audio() -> None:
+    """Empty audio should raise ValueError."""
+    with pytest.raises(ValueError, match="empty"):
+        create_ad_profile(np.array([], dtype=np.float32), SAMPLE_RATE, rough_timestamps=[])
+
+
+# ---------------------------------------------------------------------------
+# save_ad_profile / load_ad_profile
+# ---------------------------------------------------------------------------
+
+
+def test_save_load_roundtrip(tmp_path: Path) -> None:
+    """Profile saved with save_ad_profile must be loadable and identical."""
+    ad = _sine(2000, 2.0)
+    audio = _build_audio_with_repeated_ad(ad, [5.0, 20.0], total_s=30.0)
+    profile = create_ad_profile(
+        audio,
+        SAMPLE_RATE,
+        rough_timestamps=[(5.0, 7.0), (20.0, 22.0)],
+        created_from="source.flac",
+    )
+
+    base = tmp_path / "my_profile"
+    save_ad_profile(profile, base)
+
+    assert (tmp_path / "my_profile.json").exists()
+    assert (tmp_path / "my_profile.npz").exists()
+
+    loaded = load_ad_profile(base)
+    assert loaded.profile_version == profile.profile_version
+    assert loaded.sample_rate == profile.sample_rate
+    assert loaded.created_from == profile.created_from
+    assert len(loaded.fingerprints) == len(profile.fingerprints)
+    for orig_fp, loaded_fp in zip(profile.fingerprints, loaded.fingerprints, strict=True):
+        assert orig_fp.id == loaded_fp.id
+        assert orig_fp.duration_s == pytest.approx(loaded_fp.duration_s, abs=1e-6)
+        assert orig_fp.ncc_threshold == pytest.approx(loaded_fp.ncc_threshold, abs=1e-6)
+        np.testing.assert_allclose(orig_fp.template, loaded_fp.template, atol=1e-6)
+        np.testing.assert_allclose(
+            orig_fp.spectral_signature, loaded_fp.spectral_signature, atol=1e-6
+        )
+
+
+def test_save_load_path_with_extension(tmp_path: Path) -> None:
+    """save/load should work even when path is passed with .json extension."""
+    ad = _sine(2000, 1.5)
+    audio = _build_audio_with_repeated_ad(ad, [3.0], total_s=10.0)
+    profile = create_ad_profile(audio, SAMPLE_RATE, rough_timestamps=[(3.0, 4.5)])
+
+    save_ad_profile(profile, tmp_path / "profile.json")
+    loaded = load_ad_profile(tmp_path / "profile.json")
+    assert len(loaded.fingerprints) == 1
+
+
+def test_load_missing_file_raises(tmp_path: Path) -> None:
+    """Loading a non-existent profile should raise FileNotFoundError."""
+    with pytest.raises(FileNotFoundError):
+        load_ad_profile(tmp_path / "nonexistent")
+
+
+# ---------------------------------------------------------------------------
+# clean_with_profile
+# ---------------------------------------------------------------------------
+
+
+def test_clean_with_profile_remove_detects_ad() -> None:
+    """clean_with_profile with action='remove' should shorten the audio."""
+    ad = _sine(2000, 2.0)
+    audio = _concat(_sine(440, 5.0), ad, _sine(440, 5.0))
+    profile = create_ad_profile(audio, SAMPLE_RATE, rough_timestamps=[(5.0, 7.0)])
+    assert len(profile.fingerprints) > 0
+
+    # Target: same structure — ad at 5-7 s
+    target = _concat(_sine(440, 5.0), ad, _sine(440, 5.0))
+    cleaned = clean_with_profile(target, SAMPLE_RATE, profile, action="remove")
+    assert len(cleaned) < len(target)
+
+
+def test_clean_with_profile_replace_preserves_length() -> None:
+    """clean_with_profile with action='replace' should preserve audio length."""
+    ad = _sine(2000, 2.0)
+    audio = _concat(_sine(440, 5.0), ad, _sine(440, 5.0))
+    profile = create_ad_profile(audio, SAMPLE_RATE, rough_timestamps=[(5.0, 7.0)])
+
+    cleaned = clean_with_profile(audio, SAMPLE_RATE, profile, action="replace")
+    assert len(cleaned) == len(audio)
+    # Content in the ad region should have changed
+    s, e = int(5.0 * SAMPLE_RATE), int(7.0 * SAMPLE_RATE)
+    assert not np.array_equal(cleaned[s:e], audio[s:e])
+
+
+def test_clean_with_profile_duck_preserves_length() -> None:
+    """clean_with_profile with action='duck' should preserve audio length."""
+    ad = _sine(2000, 2.0)
+    audio = _concat(_sine(440, 5.0), ad, _sine(440, 5.0))
+    profile = create_ad_profile(audio, SAMPLE_RATE, rough_timestamps=[(5.0, 7.0)])
+
+    cleaned = clean_with_profile(audio, SAMPLE_RATE, profile, action="duck")
+    assert len(cleaned) == len(audio)
+    s, e = int(5.0 * SAMPLE_RATE), int(7.0 * SAMPLE_RATE)
+    in_rms = float(np.sqrt(np.mean(audio[s:e].astype(np.float64) ** 2)))
+    out_rms = float(np.sqrt(np.mean(cleaned[s:e].astype(np.float64) ** 2)))
+    assert out_rms < in_rms * 0.5
+
+
+def test_clean_with_profile_no_match_returns_copy() -> None:
+    """When no ad is found, clean_with_profile should return a copy of the input."""
+    ad = _sine(2000, 2.0)
+    ref = _concat(_sine(440, 5.0), ad, _sine(440, 5.0))
+    profile = create_ad_profile(ref, SAMPLE_RATE, rough_timestamps=[(5.0, 7.0)])
+
+    # Completely different audio — no ad
+    target = _sine(880, 10.0)
+    import warnings
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        cleaned = clean_with_profile(target, SAMPLE_RATE, profile)
+    np.testing.assert_array_equal(cleaned, target)
+
+
+def test_clean_with_profile_four_ad_intervals() -> None:
+    """Sparse-data (4 examples) profile should detect all four ad insertions."""
+    ad = _sine(2000, 2.0)
+    ad_times = [10.0, 30.0, 55.0, 80.0]
+    audio = _build_audio_with_repeated_ad(ad, ad_times, total_s=90.0)
+
+    profile = create_ad_profile(
+        audio,
+        SAMPLE_RATE,
+        rough_timestamps=[(t, t + 2.0) for t in ad_times],
+    )
+    assert len(profile.fingerprints) == 4
+
+    target = _build_audio_with_repeated_ad(ad, ad_times, total_s=90.0)
+    cleaned = clean_with_profile(target, SAMPLE_RATE, profile, action="remove")
+    # Should be noticeably shorter (>= 4 x ~2 s removed)
+    assert len(audio) - len(cleaned) >= SAMPLE_RATE * 4
+
+
+def test_clean_with_profile_drift_tolerance() -> None:
+    """Detection should be robust to ±300 ms timing drift in target file."""
+    ad = _sine(2000, 2.0)
+    # Learn from exact positions
+    ref_audio = _build_audio_with_repeated_ad(ad, [10.0, 25.0], total_s=40.0)
+    profile = create_ad_profile(
+        ref_audio,
+        SAMPLE_RATE,
+        rough_timestamps=[(10.0, 12.0), (25.0, 27.0)],
+    )
+
+    # Apply with 300 ms drift
+    drifted_audio = _build_audio_with_repeated_ad(ad, [10.3, 25.3], total_s=40.0)
+    cleaned = clean_with_profile(drifted_audio, SAMPLE_RATE, profile, action="remove")
+    assert len(cleaned) < len(drifted_audio)
+
+
+def test_clean_with_profile_cross_sample_rate() -> None:
+    """Profile learned at one sample rate should work on audio at another rate."""
+    sr_learn = 16000
+    sr_apply = 8000
+
+    ad = _sine(2000, 1.0, sr=sr_learn)
+    ref_audio = _concat(
+        _sine(440, 3.0, sr=sr_learn), ad, _sine(440, 3.0, sr=sr_learn)
+    )
+    profile = create_ad_profile(ref_audio, sr_learn, rough_timestamps=[(3.0, 4.0)])
+
+    # Target at half the sample rate
+    ad_low = _sine(2000, 1.0, sr=sr_apply)
+    target_audio = _concat(
+        _sine(440, 3.0, sr=sr_apply), ad_low, _sine(440, 3.0, sr=sr_apply)
+    )
+    cleaned = clean_with_profile(target_audio, sr_apply, profile, action="remove")
+    assert len(cleaned) < len(target_audio)
+
+
+def test_clean_with_profile_invalid_action() -> None:
+    """Unknown action should raise ValueError."""
+    audio = _sine(440, 3.0)
+    ad = _sine(2000, 1.0)
+    src = _concat(_sine(440, 1.0), ad, _sine(440, 1.0))
+    profile = create_ad_profile(src, SAMPLE_RATE, rough_timestamps=[(1.0, 2.0)])
+    with pytest.raises(ValueError, match="action"):
+        clean_with_profile(audio, SAMPLE_RATE, profile, action="silence")  # type: ignore[arg-type]
+
+
+def test_clean_with_profile_invalid_duck_db() -> None:
+    """Positive duck_db should raise ValueError."""
+    audio = _sine(440, 3.0)
+    ad = _sine(2000, 1.0)
+    src = _concat(_sine(440, 1.0), ad, _sine(440, 1.0))
+    profile = create_ad_profile(src, SAMPLE_RATE, rough_timestamps=[(1.0, 2.0)])
+    with pytest.raises(ValueError, match="duck_db"):
+        clean_with_profile(audio, SAMPLE_RATE, profile, action="duck", duck_db=6.0)
+
+
+def test_clean_with_profile_stereo_audio() -> None:
+    """clean_with_profile should accept stereo (2-D) audio."""
+    ad = _sine(2000, 1.5)
+    mono = _concat(_sine(440, 3.0), ad, _sine(440, 3.0))
+    profile = create_ad_profile(mono, SAMPLE_RATE, rough_timestamps=[(3.0, 4.5)])
+    stereo = np.stack([mono, mono], axis=1)
+    cleaned = clean_with_profile(stereo, SAMPLE_RATE, profile, action="replace")
+    assert cleaned.ndim == 2
+    assert cleaned.shape[0] == stereo.shape[0]
+
+
+def test_clean_with_profile_empty_audio() -> None:
+    """Empty audio should raise ValueError."""
+    ad = _sine(2000, 1.0)
+    src = _concat(_sine(440, 1.0), ad, _sine(440, 1.0))
+    profile = create_ad_profile(src, SAMPLE_RATE, rough_timestamps=[(1.0, 2.0)])
+    with pytest.raises(ValueError, match="empty"):
+        clean_with_profile(np.array([], dtype=np.float32), SAMPLE_RATE, profile)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end CLI: learn-ads + apply-ads-profile
+# ---------------------------------------------------------------------------
+
+
+def test_cli_learn_and_apply(tmp_path: Path) -> None:
+    """End-to-end: learn-ads + apply-ads-profile via Python entry-points."""
+    import soundfile as sf
+
+    from audio_cleaner.__main__ import main
+
+    ad = _sine(2000, 2.0)
+    audio = _build_audio_with_repeated_ad(ad, [5.0, 20.0], total_s=30.0)
+    in_file = tmp_path / "source.wav"
+    sf.write(str(in_file), audio, SAMPLE_RATE)
+
+    profile_base = str(tmp_path / "profile")
+    out_dir = tmp_path / "out"
+
+    # Step 1: learn-ads
+    import sys
+
+    sys_argv_backup = sys.argv
+    try:
+        sys.argv = [
+            "audio-cleaner",
+            "learn-ads",
+            "--input", str(in_file),
+            "--timestamps", "5.0,7.0", "20.0,22.0",
+            "--profile-out", profile_base,
+        ]
+        try:
+            main()
+        except SystemExit as exc:
+            assert exc.code == 0, f"learn-ads exited with code {exc.code}"
+    finally:
+        sys.argv = sys_argv_backup
+
+    assert (tmp_path / "profile.json").exists()
+    assert (tmp_path / "profile.npz").exists()
+
+    # Step 2: apply-ads-profile
+    try:
+        sys.argv = [
+            "audio-cleaner",
+            "apply-ads-profile",
+            "--input", str(in_file),
+            "--profile", profile_base,
+            "--output", str(out_dir),
+            "--action", "remove",
+        ]
+        try:
+            main()
+        except SystemExit as exc:
+            assert exc.code == 0, f"apply-ads-profile exited with code {exc.code}"
+    finally:
+        sys.argv = sys_argv_backup
+
+    out_file = out_dir / "source.wav"
+    assert out_file.exists()
+    cleaned, _sr = sf.read(str(out_file), dtype="float32")
+    assert len(cleaned) < len(audio)
