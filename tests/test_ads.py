@@ -787,7 +787,7 @@ def test_clean_with_profile_duck_preserves_length() -> None:
     assert out_rms < in_rms * 0.5
 
 
-def test_clean_with_profile_no_match_returns_copy(tmp_path: Path) -> None:
+def test_clean_with_profile_no_match_returns_copy() -> None:
     """When no ad is found, clean_with_profile should return a copy of the input."""
     ad = _sine(2000, 2.0)
     ref = _concat(_sine(440, 5.0), ad, _sine(440, 5.0))

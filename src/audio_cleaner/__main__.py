@@ -203,15 +203,24 @@ def _run_learn_ads(args: argparse.Namespace) -> None:
         print(f"Error: could not load '{input_path}': {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if args.resample_hz and args.resample_hz != sr:
-        from math import gcd
+    if args.resample_hz is not None:
+        if args.resample_hz <= 0:
+            print(
+                f"Error: --resample-hz must be a positive integer, got {args.resample_hz}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.resample_hz != sr:
+            from math import gcd
 
-        from scipy.signal import resample_poly  # type: ignore[attr-defined]
+            from scipy.signal import resample_poly  # type: ignore[attr-defined]
 
-        g = gcd(sr, args.resample_hz)
-        print(f"  Resampling from {sr} Hz to {args.resample_hz} Hz …")
-        audio = resample_poly(audio, args.resample_hz // g, sr // g).astype(np.float32)  # type: ignore[assignment]
-        sr = args.resample_hz
+            g = gcd(sr, args.resample_hz)
+            print(f"  Resampling from {sr} Hz to {args.resample_hz} Hz …")
+            audio = resample_poly(  # type: ignore[assignment]
+                audio, args.resample_hz // g, sr // g
+            ).astype(np.float32)
+            sr = args.resample_hz
 
     print(f"  Learning profile from {len(timestamps)} interval(s) …")
     profile = create_ad_profile(

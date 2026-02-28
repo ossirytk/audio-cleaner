@@ -448,11 +448,16 @@ def _compute_spectral_signature(
     mean_mag = np.abs(zxx).mean(axis=1)  # average over time → shape (n_freq,)
 
     n_freq = len(mean_mag)
-    bin_size = max(1, n_freq // n_bins)
-    sig = np.array(
-        [mean_mag[i * bin_size : (i + 1) * bin_size].mean() for i in range(n_bins)],
-        dtype=np.float64,
-    )
+    if n_freq >= n_bins:
+        bin_size = n_freq // n_bins
+        sig = np.array(
+            [mean_mag[i * bin_size : (i + 1) * bin_size].mean() for i in range(n_bins)],
+            dtype=np.float64,
+        )
+    else:
+        # Fewer STFT bins than requested output bins: pad with zeros
+        sig = np.zeros(n_bins, dtype=np.float64)
+        sig[:n_freq] = mean_mag
     return np.log1p(sig).astype(np.float32)
 
 
@@ -514,10 +519,16 @@ def _merge_segments(segments: list[Segment], gap_samples: int = 0) -> list[Segme
         segments: List of (start, end) sample pairs.
         gap_samples: If > 0, segments whose gap is smaller than this value are also
             merged (default: 0 — only overlapping/adjacent segments are merged).
+            Must be >= 0.
 
     Returns:
         Sorted, non-overlapping list of (start, end) pairs.
+
+    Raises:
+        ValueError: If *gap_samples* is negative.
     """
+    if gap_samples < 0:
+        raise ValueError(f"gap_samples must be >= 0, got {gap_samples}")
     if not segments:
         return []
     sorted_segs = sorted(segments)
@@ -955,23 +966,23 @@ def load_ad_profile(path: str | Path) -> AdProfile:
     with json_path.open() as fh:
         metadata = json.load(fh)
 
-    arrays = np.load(str(npz_path))
-    refinement = metadata.get("refinement", {})
+    with np.load(str(npz_path)) as arrays:
+        refinement = metadata.get("refinement", {})
 
-    fingerprints: list[AdFingerprint] = []
-    for fp_meta in metadata["fingerprints"]:
-        fp_id = fp_meta["id"]
-        fingerprints.append(
-            AdFingerprint(
-                id=fp_id,
-                duration_s=float(fp_meta["duration_s"]),
-                template=arrays[f"template_{fp_id}"].astype(np.float32),
-                spectral_signature=arrays[f"spec_{fp_id}"].astype(np.float32),
-                ncc_threshold=float(fp_meta["ncc_threshold"]),
-                spec_threshold=float(fp_meta["spec_threshold"]),
-                confidence=float(fp_meta["confidence"]),
+        fingerprints: list[AdFingerprint] = []
+        for fp_meta in metadata["fingerprints"]:
+            fp_id = fp_meta["id"]
+            fingerprints.append(
+                AdFingerprint(
+                    id=fp_id,
+                    duration_s=float(fp_meta["duration_s"]),
+                    template=arrays[f"template_{fp_id}"].astype(np.float32),
+                    spectral_signature=arrays[f"spec_{fp_id}"].astype(np.float32),
+                    ncc_threshold=float(fp_meta["ncc_threshold"]),
+                    spec_threshold=float(fp_meta["spec_threshold"]),
+                    confidence=float(fp_meta["confidence"]),
+                )
             )
-        )
 
     return AdProfile(
         profile_version=int(metadata["profile_version"]),
