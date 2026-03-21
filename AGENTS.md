@@ -2,100 +2,137 @@
 
 This file provides guidance for AI coding agents (GitHub Copilot, Cursor, etc.) working on the **audio-cleaner** project.
 
+The repository is currently developed primarily from a **Windows dev drive** using **PowerShell** and **VS Code**.
+WSL/Ubuntu and alternative editors remain supported as long as workflows stay terminal-reproducible.
+
+## Available CLI Tools
+
+| Tool | Purpose |
+|------|---------|
+| `rg` | Fast file content search (ripgrep) |
+| `fd` | Fast file finder |
+| `fzf` | Fuzzy finder for interactive selection |
+| `ast-grep` | Structural code search and rewrite (AST-aware) |
+| `tokei` | Count lines of code by language |
+| `diff` / `diffutils` | File diffing |
+| `zip` | Archive creation |
+| `jq` | JSON query and transformation CLI |
+| `yq` | YAML/JSON/TOML query and transformation CLI |
+| `hyperfine` | Command-line benchmarking with statistical output |
+| `pre-commit` | Run and manage repository pre-commit hooks |
+| `http` / `https` (HTTPie) | Human-friendly HTTP API client |
+| `difft` (difftastic) | Syntax-aware structural diffing |
+| `bat` | Cat clone with syntax highlighting and Git integration |
+| `delta` | Syntax-highlighting pager for git diffs (git-delta) |
+| `sd` | Intuitive find-and-replace CLI (sed alternative) |
+| `tldr` | Simplified, community-driven man pages (tealdeer) |
+| `grex` | Generate regular expressions from example strings |
+
+## Copilot Tooling Preferences
+
+Use these defaults so Copilot has predictable, low-friction command choices.
+
+### Preferred command order
+
+- Content search: `rg` first, then `ast-grep` for structural/language-aware matching.
+- File discovery: `fd` first, then `rg --files` as a fallback.
+- JSON config inspection: `jq`.
+- YAML/TOML inspection: `yq`.
+- HTTP/API smoke checks: `http` / `https` (HTTPie).
+- Diff/review: `difft` for syntax-aware diffs, `diff` for plain text diffs, `delta` for git diffs
+- Performance comparisons: `hyperfine` for repeatable timing.
+
+### Avoid in autonomous runs
+
+- Avoid interactive-only flows (for example `fzf` prompts) unless explicitly requested.
+- Avoid destructive git or file operations unless explicitly approved.
+- Avoid long-running watch commands by default; use one-shot checks first.
+- Avoid `pre-commit run --all-files` on very large repos when scoped checks are sufficient.
+
 ## Project Overview
 
-`audio-cleaner` is a Python library and CLI tool that processes FLAC and WAV audio files to:
-
-1. **Improve poor audio quality** — normalisation, dynamic-range compression, equalisation, de-clipping.
-2. **Detect and remove ads / interrupts** — silence detection, audio fingerprinting, segment classification.
+`audio-cleaner` contains tooling to **train a custom HDemucs model** that detects and removes
+radio jingles and adverts from audio recordings via source separation.  The model treats jingles
+as the *vocals* stem and clean background music as the *other* stem.
 
 ## Repository Layout
 
 ```
 audio-cleaner/
-├── src/
-│   └── audio_cleaner/       # Main package
-│       ├── __init__.py
-│       ├── __main__.py      # CLI entry-point
-│       ├── quality.py       # Audio quality improvement
-│       └── ads.py           # Ad / interrupt detection & removal
-├── tests/                   # pytest test suite
-│   └── test_*.py
-├── docs/                    # Planning & design documents
-│   └── plan-audio-quality.md
-├── pyproject.toml           # Project metadata, ruff, pyrefly, pytest config
+├── scripts/                 # HDemucs training utility scripts
+│   ├── config.py            # Centralised path config (override with JINGLE_BASE_DIR)
+│   ├── create_samples.py    # Slice source FLACs into 40-second WAV clips
+│   ├── generate_dataset.py  # Build musdb-style training dataset
+│   └── separate_audio.py    # Run inference with a trained HDemucs checkpoint
+├── patches/                 # Overrides for installed demucs and dora-search packages
+│   ├── README.md            # Documents each patch and why it exists
+│   ├── demucs/              # Modified demucs library files (wav.py, train.py, …)
+│   └── dora/                # Windows-compatible write_and_rename fix
+├── conf/                    # Hydra config for dora/demucs training
+│   └── config.yaml
+├── justfile                 # Task runner recipes
+├── pyproject.toml           # Project metadata and ruff config
 ├── AGENTS.md                # ← you are here
 └── README.md
 ```
 
+Data lives under `I:\jingle_removal\` by default (override with `JINGLE_BASE_DIR`):
+
+```
+I:\jingle_removal\
+├── music_sources\             # Raw FLAC music files
+├── music_sources_cassettes\   # Optional second raw FLAC folder
+├── music_clips\               # 40-second WAV clips (create-samples output)
+├── jingles_original\          # Raw jingle recordings
+├── jingles_processed\         # Normalised jingle recordings
+├── training_dataset\          # musdb-style dataset (generate-dataset output)
+│   ├── train\<track>\  {drums,bass,other,vocals,mixture}.wav
+│   └── valid\<track>\  …
+├── outputs\                   # Dora training checkpoints
+└── test_audio\mixture.wav     # Input for inference
+```
+
 ## Toolchain
 
-| Tool       | Purpose                        | Command                     |
-|------------|--------------------------------|-----------------------------|
-| `uv`       | Package & virtual-env manager  | `uv sync` / `uv run`        |
-| `ruff`     | Linter + code formatter        | `ruff check src tests`      |
-| `pyrefly`  | Static type checker            | `pyrefly check src`         |
-| `pytest`   | Test runner                    | `uv run pytest`             |
+| Tool   | Purpose                       | Command                          |
+|--------|-------------------------------|----------------------------------|
+| `uv`   | Package & virtual-env manager | `uv sync` / `uv run`             |
+| `ruff` | Linter + code formatter       | `uv run ruff check scripts`      |
 
 ### Setup
 
-```bash
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+```powershell
+# Install uv (if not already installed on Windows)
+powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# Create virtual environment and install all dependencies
-uv sync --extra dev
+# Install training extras + apply demucs/dora patches
+uv sync --extra dev --extra training
+uv run python scripts/apply_patches.py
 
-# Verify the setup
-uv run audio-cleaner --help
+# Override torch with a CUDA build (GPU training)
+uv pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu126
+uv run python scripts/apply_patches.py
 ```
 
 ### Running quality checks
 
-```bash
-# Format & lint
-ruff format src tests
-ruff check src tests
-
-# Type check
-pyrefly check src
-
-# Tests
-uv run pytest
+```powershell
+uv run ruff check scripts        # lint
+uv run ruff format --check scripts  # format check
+uv run ruff check --fix scripts  # auto-fix
 ```
 
 ## Coding Standards
 
-- **Python ≥ 3.12** — use modern syntax (f-strings, `match`, structural pattern matching, `|` union types, etc.).
+- **Python ≥ 3.12** — use modern syntax (f-strings, `match`, `|` union types, etc.).
 - **Type annotations** — every public function and method must have full type annotations.
 - **Docstrings** — use Google-style docstrings for all public symbols.
-- **Line length** — maximum 100 characters (enforced by ruff).
+- **Line length** — maximum 120 characters (enforced by ruff).
 - **Imports** — stdlib → third-party → first-party, separated by blank lines (enforced by ruff/isort).
 - **No bare `except`** — always catch specific exception types.
-- **Pure Python preferred** — prefer `scipy`, `numpy`, and `soundfile` over heavy external binaries.
-
-## Supported Audio Formats
-
-| Format | Extension | Notes                            |
-|--------|-----------|----------------------------------|
-| FLAC   | `.flac`   | Lossless, primary target format  |
-| WAV    | `.wav`    | Uncompressed PCM                 |
-
-All audio is loaded as float32 numpy arrays via `soundfile` or `librosa`.  
-Sample rate is preserved unless the user explicitly requests resampling.
-
-## Key Design Decisions
-
-1. **Pure-Python first** — avoid shell-outs to `ffmpeg` or other binaries unless no Python alternative exists.
-2. **Non-destructive by default** — original files are never overwritten; outputs go to a user-specified directory.
-3. **Pipeline architecture** — cleaning steps are composable so users can chain them (e.g., normalise → remove ads).
-4. **Batch processing** — the CLI accepts a directory or glob pattern as input.
-5. **Reproducible** — all random seeds and configurable parameters are exposed via `pyproject.toml` or CLI flags.
 
 ## PR Guidelines
 
 - Keep PRs focused: one feature / fix per PR.
-- All new code must have corresponding tests in `tests/`.
-- Run `ruff check`, `pyrefly check`, and `pytest` before opening a PR.
+- Run `uv run ruff check scripts` before opening a PR.
 - PR titles should follow Conventional Commits: `feat:`, `fix:`, `docs:`, `chore:`.
-- Reference the relevant planning document (e.g., `docs/plan-audio-quality.md`) in the PR description.

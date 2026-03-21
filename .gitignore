@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ---------------------------------------------------------------------------
+# HDemucs training (audio-jingle-tools)
+# ---------------------------------------------------------------------------
+
+# Training data — large audio files; store outside the repo or use DVC
+data/
+
+# Model checkpoints and training outputs (dora)
+outputs/
+*.th
+*.pt
+
+# Hydra / dora metadata cache
+metadata/
+multirun/
+.dora/
