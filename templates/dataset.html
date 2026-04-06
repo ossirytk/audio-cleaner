@@ -1,0 +1,140 @@
+{% extends "layout.html" %}
+{% block title %} — Dataset{% endblock %}
+{% block topbar %}Dataset Management{% endblock %}
+{% block content %}
+
+<script>
+  function showTab(id) {
+    document.querySelectorAll('.tab-pane').forEach(el => el.style.display = 'none');
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    document.getElementById(id).style.display = 'block';
+    event.currentTarget.classList.add('active');
+  }
+</script>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="showTab('tab-music')">🎵 Music clips</button>
+  <button class="tab-btn" onclick="showTab('tab-jingles')">🔔 Jingles (raw)</button>
+  <button class="tab-btn" onclick="showTab('tab-jingles-proc')">✅ Jingles (processed)</button>
+  <button class="tab-btn" onclick="showTab('tab-tracks')">🗂️ Dataset tracks</button>
+  <button class="tab-btn" onclick="showTab('tab-pipeline')">⚙️ Run pipeline</button>
+</div>
+
+<!-- Music clips -->
+<div id="tab-music" class="tab-pane">
+  <div class="card">
+    <div class="flex-between" style="margin-bottom:0.75rem;">
+      <p class="card-title" style="margin:0;">Music clips ({{ music_clips | length }})</p>
+      <form hx-post="/upload/music-clip" hx-target="#music-list" hx-swap="outerHTML"
+            hx-encoding="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;">
+        <input type="file" name="file" accept=".wav,.flac,.mp3" required style="width:auto;" />
+        <button type="submit" class="btn btn-primary btn-sm">Upload</button>
+      </form>
+    </div>
+    <div id="music-list">{% include "partials/file_list.html" with context %}</div>
+  </div>
+</div>
+
+<!-- Jingles raw -->
+<div id="tab-jingles" class="tab-pane" style="display:none;">
+  <div class="card">
+    <div class="flex-between" style="margin-bottom:0.75rem;">
+      <p class="card-title" style="margin:0;">Raw jingle recordings ({{ jingles_original | length }})</p>
+      <form hx-post="/upload/jingle" hx-target="#jingle-list" hx-swap="outerHTML"
+            hx-encoding="multipart/form-data" style="display:flex;gap:0.5rem;align-items:center;">
+        <input type="file" name="file" accept=".wav,.flac,.mp3" required style="width:auto;" />
+        <button type="submit" class="btn btn-primary btn-sm">Upload</button>
+      </form>
+    </div>
+    <div id="jingle-list">
+      {% set files = jingles_original %}
+      {% set list_id = "jingle-list" %}
+      {% include "partials/file_list.html" with context %}
+    </div>
+  </div>
+</div>
+
+<!-- Jingles processed -->
+<div id="tab-jingles-proc" class="tab-pane" style="display:none;">
+  <div class="card">
+    <p class="card-title">Processed jingles ({{ jingles_processed | length }})</p>
+    {% set files = jingles_processed %}
+    {% include "partials/file_list.html" with context %}
+  </div>
+</div>
+
+<!-- Dataset tracks -->
+<div id="tab-tracks" class="tab-pane" style="display:none;">
+  <div class="grid-2">
+    <div class="card">
+      <p class="card-title">Train ({{ tracks.train | length }} tracks)</p>
+      {% if tracks.train %}
+      <ul class="file-list">
+        {% for t in tracks.train %}<li><span>{{ t }}</span></li>{% endfor %}
+      </ul>
+      {% else %}
+      <p class="text-muted" style="font-size:0.875rem;">No training tracks yet.</p>
+      {% endif %}
+    </div>
+    <div class="card">
+      <p class="card-title">Valid ({{ tracks.valid | length }} tracks)</p>
+      {% if tracks.valid %}
+      <ul class="file-list">
+        {% for t in tracks.valid %}<li><span>{{ t }}</span></li>{% endfor %}
+      </ul>
+      {% else %}
+      <p class="text-muted" style="font-size:0.875rem;">No validation tracks yet.</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<!-- Pipeline -->
+<div id="tab-pipeline" class="tab-pane" style="display:none;">
+  <div class="grid-2">
+
+    <div class="card">
+      <p class="card-title">Step 1 — Create samples</p>
+      <p class="text-muted" style="font-size:0.85rem;margin-bottom:1rem;">
+        Slice source FLACs in <code>music_sources/</code> into 40-second WAV clips.
+      </p>
+      <button class="btn btn-primary"
+        hx-post="/pipeline/create-samples"
+        hx-target="#pipeline-log"
+        hx-swap="innerHTML">
+        ▶ Run create_samples
+      </button>
+    </div>
+
+    <div class="card">
+      <p class="card-title">Step 2 — Generate dataset</p>
+      <p class="text-muted" style="font-size:0.85rem;margin-bottom:1rem;">
+        Mix clips + jingles into a musdb-style dataset with stems.
+      </p>
+      <button class="btn btn-primary"
+        hx-post="/pipeline/generate-dataset"
+        hx-target="#pipeline-log"
+        hx-swap="innerHTML">
+        ▶ Run generate_dataset
+      </button>
+    </div>
+
+  </div>
+
+  <div class="card" style="margin-top:0.5rem;">
+    <p class="card-title">Pipeline log</p>
+    <div id="pipeline-log" class="log-panel">Idle.</div>
+  </div>
+
+  <div class="card" style="margin-top:0;">
+    <p class="card-title">Live job log</p>
+    <div id="pipeline-live-log" class="log-panel"
+         hx-ext="sse"
+         sse-connect="/api/stream-log"
+         sse-swap="message"
+         hx-swap="beforeend">
+    </div>
+  </div>
+</div>
+
+{% endblock %}

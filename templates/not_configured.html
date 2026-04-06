@@ -1,0 +1,22 @@
+{% extends "layout.html" %}
+{% block title %} — Setup required{% endblock %}
+{% block topbar %}Setup required{% endblock %}
+{% block content %}
+
+<div style="max-width:540px;margin:3rem auto;text-align:center;">
+  <div style="font-size:3rem;margin-bottom:1rem;">⚙️</div>
+  <h2 style="margin-bottom:0.5rem;">Data directory not found</h2>
+  <p class="text-muted" style="margin-bottom:1.5rem;">
+    The configured data directory does not exist:<br>
+    <code style="display:inline-block;margin-top:0.5rem;padding:0.3rem 0.6rem;background:var(--bg3);border-radius:4px;">{{ base_dir }}</code>
+  </p>
+  <p style="font-size:0.875rem;color:var(--text-muted);margin-bottom:2rem;">
+    Go to Settings to set the correct path. It will be saved to <code>.env</code>
+    in the project root and remembered across server restarts.
+  </p>
+  <a href="/settings" class="btn btn-primary" style="font-size:1rem;padding:0.65rem 1.5rem;">
+    ⚙️ Open Settings
+  </a>
+</div>
+
+{% endblock %}

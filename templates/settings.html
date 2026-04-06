@@ -1,0 +1,38 @@
+{% extends "layout.html" %}
+{% block title %} — Settings{% endblock %}
+{% block topbar %}Settings{% endblock %}
+{% block content %}
+
+<div class="card" style="max-width:640px;">
+  <p class="card-title">Data directory</p>
+  <form hx-post="/settings/save" hx-target="#settings-msg" hx-swap="outerHTML">
+    <div class="form-row">
+      <label for="base_dir">JINGLE_BASE_DIR</label>
+      <input type="text" id="base_dir" name="base_dir" value="{{ base_dir }}"
+             placeholder="D:\data" />
+      <p class="text-muted mt-1" style="font-size:0.78rem;">
+        Root folder containing <code>music_clips/</code>, <code>jingles_original/</code>,
+        <code>training_dataset/</code>, etc. Saved to <code>.env</code> in the project root.
+        The server will restart automatically to apply the new path.
+      </p>
+    </div>
+    <button type="submit" class="btn btn-primary">💾 Save</button>
+  </form>
+  <div id="settings-msg"></div>
+</div>
+
+<div class="card" style="max-width:640px; margin-top:0;">
+  <p class="card-title">Resolved paths</p>
+  <table style="width:100%;font-size:0.82rem;border-collapse:collapse;">
+    <tbody>
+      {% for label, path in paths.items() %}
+      <tr>
+        <td style="padding:0.35rem 0.5rem 0.35rem 0;color:var(--text-muted);white-space:nowrap;vertical-align:top;">{{ label }}</td>
+        <td style="padding:0.35rem 0;font-family:monospace;word-break:break-all;">{{ path }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% endblock %}

@@ -1,0 +1,10 @@
+{% set css_class = '' %}
+{% if '[error' in line.lower() or 'error' in line.lower() or 'traceback' in line.lower() or 'fatal' in line.lower() %}
+  {% set css_class = 'log-error' %}
+{% elif 'warning' in line.lower() or 'warn' in line.lower() %}
+  {% set css_class = 'log-warn' %}
+{% elif 'info' in line.lower() %}
+  {% set css_class = 'log-info' %}
+{% endif %}
+<span class="{{ css_class }}">{{ line }}
+</span>

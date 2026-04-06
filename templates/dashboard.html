@@ -1,0 +1,49 @@
+{% extends "layout.html" %}
+{% block title %} — Dashboard{% endblock %}
+{% block topbar %}Dashboard{% endblock %}
+{% block content %}
+
+<div class="grid-4" style="margin-bottom:1rem;">
+  <div class="stat"><div class="stat-value">{{ summary.music_clips }}</div><div class="stat-label">Music Clips</div></div>
+  <div class="stat"><div class="stat-value">{{ summary.jingles_original }}</div><div class="stat-label">Jingles (raw)</div></div>
+  <div class="stat"><div class="stat-value">{{ summary.train_tracks }}</div><div class="stat-label">Train Tracks</div></div>
+  <div class="stat"><div class="stat-value">{{ summary.valid_tracks }}</div><div class="stat-label">Valid Tracks</div></div>
+</div>
+
+<div class="grid-2">
+
+  <div class="card">
+    <p class="card-title">Checkpoints</p>
+    {% if checkpoints %}
+    <ul class="file-list">
+      {% for ckpt in checkpoints %}
+      <li>
+        <span>{{ ckpt.xp_name }}{% if ckpt.is_latest %} <span class="badge badge-running">latest</span>{% endif %}</span>
+        <span class="text-muted" style="font-size:0.75rem;">{{ ckpt.path.parent | string | truncate(40, True, '…') }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-muted" style="font-size:0.875rem;">No checkpoints found. Run training first.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <p class="card-title">Job Status</p>
+    <div id="job-status-box" hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="outerHTML">
+      {% include "partials/job_status.html" %}
+    </div>
+  </div>
+
+</div>
+
+<div class="card">
+  <p class="card-title">Quick actions</p>
+  <div class="flex-gap">
+    <a href="/dataset" class="btn">📁 Manage dataset</a>
+    <a href="/training" class="btn btn-primary">🏋️ Start training</a>
+    <a href="/inference" class="btn">🎛️ Run inference</a>
+  </div>
+</div>
+
+{% endblock %}

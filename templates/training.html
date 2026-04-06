@@ -1,0 +1,90 @@
+{% extends "layout.html" %}
+{% block title %} — Training{% endblock %}
+{% block topbar %}Model Training{% endblock %}
+{% block content %}
+
+<div class="grid-2">
+
+  <!-- Config form -->
+  <div class="card">
+    <p class="card-title">Hyperparameters</p>
+    <form id="train-form" hx-post="/training/start" hx-target="#train-status" hx-swap="outerHTML">
+      <div class="form-grid">
+        <div class="form-row">
+          <label for="epochs">Epochs</label>
+          <input type="number" id="epochs" name="epochs" value="{{ config.epochs }}" min="1" />
+        </div>
+        <div class="form-row">
+          <label for="batch_size">Batch size</label>
+          <input type="number" id="batch_size" name="batch_size" value="{{ config.batch_size }}" min="1" />
+        </div>
+        <div class="form-row">
+          <label for="lr">Learning rate</label>
+          <input type="text" id="lr" name="lr" value="{{ config.lr }}" />
+        </div>
+        <div class="form-row">
+          <label for="group_size">Remix group size</label>
+          <input type="number" id="group_size" name="group_size" value="{{ config.group_size }}" min="1" />
+        </div>
+        <div class="form-row">
+          <label for="test_every">Test every (epochs)</label>
+          <input type="number" id="test_every" name="test_every" value="{{ config.test_every }}" min="1" />
+        </div>
+        <div class="form-row">
+          <label for="weights">Stem weights (d,b,o,v)</label>
+          <input type="text" id="weights" name="weights" value="{{ config.weights }}" />
+        </div>
+        <div class="form-row">
+          <label for="name">Run name (optional)</label>
+          <input type="text" id="name" name="name" value="{{ config.name }}" placeholder="HIFI_HDEMUCS" />
+        </div>
+      </div>
+      <div class="flex-gap mt-1">
+        <button type="submit" class="btn btn-primary" id="btn-start">▶ Start training</button>
+        <button type="button" class="btn btn-danger"
+          hx-post="/training/stop" hx-target="#train-status" hx-swap="outerHTML">
+          ■ Stop
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Status -->
+  <div class="card">
+    <p class="card-title">Status</p>
+    <div id="train-status"
+         hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="outerHTML">
+      {% include "partials/job_status.html" %}
+    </div>
+    <hr />
+    <p class="card-title" style="margin-top:0.5rem;">Checkpoints</p>
+    {% if checkpoints %}
+    <ul class="file-list">
+      {% for ckpt in checkpoints %}
+      <li>
+        <span>{{ ckpt.xp_name }}{% if ckpt.is_latest %} <span class="badge badge-running">latest</span>{% endif %}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-muted" style="font-size:0.875rem;">No checkpoints yet.</p>
+    {% endif %}
+  </div>
+
+</div>
+
+<!-- Live log -->
+<div class="card">
+  <div class="flex-between" style="margin-bottom:0.5rem;">
+    <p class="card-title" style="margin:0;">Live log</p>
+    <button class="btn btn-sm" onclick="document.getElementById('train-log').scrollTop=9999999;">↓ scroll</button>
+  </div>
+  <div id="train-log" class="log-panel"
+       hx-ext="sse"
+       sse-connect="/api/stream-log"
+       sse-swap="message"
+       hx-swap="beforeend">
+  </div>
+</div>
+
+{% endblock %}

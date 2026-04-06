@@ -21,6 +21,206 @@ jingles removed.
 > **Don't have isolated jingle recordings?** See
 > [Getting isolated jingle stems](#getting-isolated-jingle-stems) below.
 
+---
+
+## Quickstart for new users
+
+> This section is written for people who are not very familiar with programming or the command
+> line. It walks through everything from scratch. Experienced users can skip straight to
+> [Prerequisites](#prerequisites).
+
+### What you will need
+
+- A **Windows PC** (Windows 10 or 11)
+- An internet connection to download tools
+- Your audio files — music clips and jingle recordings
+
+### Step A — Install the required tools
+
+You need to install three small programs before you can use audio-cleaner. Each installation takes
+about a minute.
+
+**1. Install Python**
+
+Go to [python.org/downloads](https://www.python.org/downloads/) and download the latest
+**Python 3.12** installer. Run it, and on the first screen make sure to tick
+**"Add Python to PATH"** before clicking Install.
+
+To check it worked, open **PowerShell** (press `Win + R`, type `powershell`, press Enter) and type:
+```
+python --version
+```
+You should see something like `Python 3.12.x`.
+
+**2. Install uv** (the package manager this project uses)
+
+In the same PowerShell window, paste this line and press Enter:
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+Close and re-open PowerShell when it finishes so the new tool is available.
+
+**3. Install FFmpeg** (needed for reading audio files)
+
+In PowerShell, paste and press Enter:
+```powershell
+winget install --id Gyan.FFmpeg
+```
+If `winget` is not available, download the FFmpeg build from
+[ffmpeg.org/download.html](https://ffmpeg.org/download.html), extract it somewhere (e.g.
+`C:\ffmpeg`), and add its `bin` folder to your system PATH.
+
+---
+
+### Step B — Get the audio-cleaner files
+
+If you received audio-cleaner as a ZIP file, extract it to a folder on your computer — for
+example `C:\audio-cleaner`.
+
+If you use Git, clone the repository instead:
+```powershell
+git clone https://github.com/your-org/audio-cleaner.git C:\audio-cleaner
+```
+
+---
+
+### Step C — Open a terminal in the project folder
+
+Open **PowerShell** and navigate to the folder where you extracted or cloned audio-cleaner:
+```powershell
+cd C:\audio-cleaner
+```
+*(Replace `C:\audio-cleaner` with the actual path if you used a different location.)*
+
+---
+
+### Step D — Install project dependencies
+
+Run these two commands one after the other. Each one may take a few minutes the first time:
+```powershell
+uv sync --extra dev --extra training --extra web
+uv run python scripts/apply_patches.py
+```
+You should see a message saying the patches were applied. If you see any red error text, check
+that Python and uv were installed correctly in Step A.
+
+---
+
+### Step E — Start the web server
+
+In the same PowerShell window, run:
+```powershell
+uv run uvicorn web_app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+You will see some lines of text ending with something like:
+```
+INFO:     Application startup complete.
+```
+**Leave this window open.** The server keeps running for as long as this window is open. If you
+close it, the web interface will stop working.
+
+---
+
+### Step F — Open the web interface
+
+Open your web browser (Chrome, Edge, Firefox — any will work) and go to:
+```
+http://127.0.0.1:8000
+```
+
+You should see the audio-cleaner dashboard. 🎉
+
+---
+
+### Step G — Tell the app where your data is
+
+The first time you open the app you will see a message saying the data directory is not
+configured. Click **Settings** in the left sidebar and set the **Data directory** to the folder
+where you want to keep your audio files — for example `D:\jingle_removal`. Click **Save**, and
+the page will reload automatically.
+
+---
+
+### Step H — Use the pipeline
+
+The left sidebar has five sections:
+
+| Section | What it does |
+|---------|-------------|
+| **Dashboard** | Overview of your data and any running job |
+| **Dataset** | Prepare music clips and jingle files; build the training dataset |
+| **Training** | Start/stop model training; watch live progress |
+| **Inference** | Upload a recording and run it through your trained model to clean it |
+| **Settings** | Change the data directory path |
+
+Work through **Dataset → Training → Inference** in order. Each section has buttons and forms —
+you do not need to use the command line again unless something goes wrong.
+
+---
+
+### Stopping and restarting the server
+
+To stop the server, go back to the PowerShell window and press `Ctrl + C`.
+
+To start it again, run the same command as Step E:
+```powershell
+uv run uvicorn web_app:app --host 127.0.0.1 --port 8000 --reload
+```
+
+---
+
+## Web UI
+
+The web interface (`web_app.py`) is a browser-based frontend for the full pipeline. It provides
+forms and live log streaming for all pipeline steps so you do not need to remember long command
+lines.
+
+### Starting the server
+
+**From the terminal (any platform):**
+```powershell
+uv run uvicorn web_app:app --host 127.0.0.1 --port 8000 --reload
+```
+Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. The `--reload` flag
+means the server restarts automatically whenever you edit Python or template files — useful
+during development.
+
+**From VS Code:**
+
+Open the Command Palette (`Ctrl + Shift + P`) → **Tasks: Run Task** → pick one of:
+
+| Task | What it does |
+|------|-------------|
+| **Start web server (Windows)** | Launches uvicorn with `--reload` in a dedicated terminal panel |
+| **Stop web server (Windows)** | Kills the process listening on port 8000 |
+| **Restart web server (Windows)** | Stop + Start in sequence |
+
+These tasks are defined in `.vscode/tasks.json` and work without any extra setup once the
+dependencies are installed.
+
+### Installing web dependencies
+
+The web server requires a small set of extra packages. Install them with:
+```powershell
+uv sync --extra web
+```
+Or install everything at once (recommended):
+```powershell
+uv sync --extra dev --extra training --extra web
+```
+
+### Configuration
+
+The app reads `JINGLE_BASE_DIR` from a `.env` file in the project root (or from the environment).
+You can set this through the **Settings** page in the UI — it writes `.env` automatically and
+reloads the server. Alternatively, create `.env` by hand:
+```
+JINGLE_BASE_DIR=D:\my_audio_data
+```
+
+---
+
 ## Prerequisites
 
 - Windows (primary), Linux, or macOS
