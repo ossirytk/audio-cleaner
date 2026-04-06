@@ -24,7 +24,7 @@ jingles removed.
 ## Prerequisites
 
 - Windows (primary), Linux, or macOS
-- Python 3.13 or later
+- Python 3.12
 - [uv](https://github.com/astral-sh/uv) package manager (installed in Step 1)
 - [FFmpeg](https://ffmpeg.org/) — required for audio decoding. Install via:
   ```powershell
@@ -216,9 +216,9 @@ stems and the best training results.
 
 ## Patches
 
-`patches/` contains small fixes to the upstream `demucs` and `dora-search` packages that are
-required for this project to work correctly on Windows. They are applied automatically as part of
-Step 1 above (`uv run python scripts/apply_patches.py`).
+`patches/` contains small fixes to the upstream `demucs` package that are required for this
+project to work correctly on Windows. They are applied automatically as part of Step 1 above
+(`uv run python scripts/apply_patches.py`).
 
 See [`patches/README.md`](patches/README.md) for the full change list.
 

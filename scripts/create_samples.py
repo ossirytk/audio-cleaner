@@ -49,6 +49,20 @@ def sanitise_filename(name: str, max_len: int = MAX_FILENAME_LEN) -> str:
     return clean
 
 
+def _existing_stems(folder: Path) -> set[str]:
+    """Return the set of sanitized stems already present in *folder*.
+
+    Output filenames follow the pattern ``{counter:04d} - {clean_name}.wav``;
+    this function extracts the ``clean_name`` portion of each existing file.
+    """
+    stems: set[str] = set()
+    for f in folder.glob("*.wav"):
+        parts = f.stem.split(" - ", 1)
+        if len(parts) == 2:
+            stems.add(parts[1])
+    return stems
+
+
 def create_samples() -> None:
     TARGET_FOLDER.mkdir(parents=True, exist_ok=True)
 
@@ -64,11 +78,14 @@ def create_samples() -> None:
     counter = last_index
     new_samples = 0
 
+    # Precompute existing sanitized stems for O(1) exact-match duplicate detection.
+    existing_stems = _existing_stems(TARGET_FOLDER)
+
     for file_path in tqdm(flac_files):
         clean_name = sanitise_filename(file_path.stem)
 
-        # Skip if a file with the same stem already exists
-        if any(clean_name in f.name for f in TARGET_FOLDER.glob("*.wav")):
+        # Skip if a file with the same stem already exists (exact match)
+        if clean_name in existing_stems:
             continue
 
         try:

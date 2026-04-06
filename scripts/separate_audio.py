@@ -5,8 +5,6 @@ The "vocals" output contains the isolated jingle / advert signal.
 Usage::
 
     uv run python -m scripts.separate_audio
-    # or:
-    just separate INPUT=path/to/mixture.wav
 
 Override the model folder or input/output paths in ``scripts/config.py`` or via
 the ``JINGLE_BASE_DIR`` environment variable.
@@ -25,6 +23,13 @@ def find_latest_checkpoint(model_folder: str = "") -> Path:
     """Return the checkpoint path, either from a named folder or the most recently modified one."""
     if model_folder:
         return MODEL_OUTPUTS_DIR / model_folder / "checkpoint.th"
+
+    if not MODEL_OUTPUTS_DIR.is_dir():
+        msg = (
+            f"Model outputs directory not found: {MODEL_OUTPUTS_DIR}. "
+            "Run training first to generate experiment checkpoints."
+        )
+        raise FileNotFoundError(msg)
 
     all_xps = [d for d in MODEL_OUTPUTS_DIR.iterdir() if d.is_dir()]
     if not all_xps:

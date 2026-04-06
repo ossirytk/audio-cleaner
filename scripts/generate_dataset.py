@@ -14,6 +14,7 @@ Run::
 """
 
 import random
+from pathlib import Path
 
 import numpy as np
 from pydub import AudioSegment
@@ -42,14 +43,51 @@ def random_position(total_duration_ms: int, jingle_duration_ms: int) -> int:
     return int(random.uniform(0.0, 1.0) * max_pos)
 
 
+def _get_required_audio_files(directory: Path, directory_name: str) -> list[Path]:
+    """Return eligible audio files from a required directory or raise a clear error.
+
+    Args:
+        directory: Path to the directory to check.
+        directory_name: Human-readable name used in error messages.
+
+    Returns:
+        Sorted list of .wav and .flac files found in *directory*.
+
+    Raises:
+        ValueError: If the directory is missing, not a directory, or contains no audio files.
+    """
+    if not directory.exists():
+        msg = (
+            f"{directory_name} does not exist: {directory}. "
+            f"Create this directory and populate it with at least one .wav or .flac file."
+        )
+        raise ValueError(msg)
+    if not directory.is_dir():
+        msg = (
+            f"{directory_name} is not a directory: {directory}. "
+            f"Update the configuration to point to a directory containing .wav or .flac files."
+        )
+        raise ValueError(msg)
+
+    files = sorted(f for f in directory.iterdir() if f.is_file() and f.suffix.lower() in {".wav", ".flac"})
+    if not files:
+        msg = (
+            f"{directory_name} contains no eligible audio files: {directory}. "
+            f"Populate it with at least one .wav or .flac file."
+        )
+        raise ValueError(msg)
+
+    return files
+
+
 def process_files() -> None:
-    music_files = sorted(f for f in INPUT_MUSIC_DIR.iterdir() if f.suffix in {".wav", ".flac"})
+    music_files = _get_required_audio_files(INPUT_MUSIC_DIR, "INPUT_MUSIC_DIR")
     split_idx = int(len(music_files) * TRAIN_SPLIT)
 
     jingles_processed = [
-        AudioSegment.from_file(f) for f in PROCESSED_JINGLES_DIR.iterdir() if f.suffix in {".wav", ".flac"}
+        AudioSegment.from_file(f) for f in _get_required_audio_files(PROCESSED_JINGLES_DIR, "PROCESSED_JINGLES_DIR")
     ]
-    jingles_original = [f for f in ORIGINAL_JINGLES_DIR.iterdir() if f.suffix in {".wav", ".flac"}]
+    jingles_original = _get_required_audio_files(ORIGINAL_JINGLES_DIR, "ORIGINAL_JINGLES_DIR")
 
     for idx, music_file in enumerate(music_files):
         subset = "train" if idx < split_idx else "valid"

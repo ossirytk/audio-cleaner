@@ -28,7 +28,7 @@ train *ARGS:
         epochs=100 \
         ++batch_size=2 \
         ++segments=8 \
-        ++num_workers=0 \
+        ++misc.num_workers=0 \
         ++dset.num_workers=0 \
         ++optim.lr=0.0002 \
         "++weights=[0.1,0.1,1.0,10.0]" \

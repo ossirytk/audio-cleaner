@@ -64,11 +64,10 @@ audio-cleaner/
 │   ├── create_samples.py    # Slice source FLACs into 40-second WAV clips
 │   ├── generate_dataset.py  # Build musdb-style training dataset
 │   └── separate_audio.py    # Run inference with a trained HDemucs checkpoint
-├── patches/                 # Overrides for installed demucs and dora-search packages
+├── patches/                 # Overrides for installed demucs package files
 │   ├── README.md            # Documents each patch and why it exists
-│   ├── demucs/              # Modified demucs library files (wav.py, train.py, …)
-│   └── dora/                # Windows-compatible write_and_rename fix
-├── conf/                    # Hydra config for dora/demucs training
+│   └── demucs/              # Modified demucs library files (wav.py, train.py, …)
+├── conf/                    # Hydra config for demucs training
 │   └── config.yaml
 ├── justfile                 # Task runner recipes
 ├── pyproject.toml           # Project metadata and ruff config
