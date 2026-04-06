@@ -1,0 +1,11 @@
+{% set files = files if files is defined else music_clips %}
+<ul class="file-list">
+  {% for f in files %}
+  <li>
+    <span>{{ f.name }}</span>
+    <span class="file-size">{{ f.size_mb }} MB</span>
+  </li>
+  {% else %}
+  <li><span class="text-muted">No files found.</span></li>
+  {% endfor %}
+</ul>

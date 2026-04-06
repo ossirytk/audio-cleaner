@@ -1,0 +1,18 @@
+{% set status_class = {
+  'IDLE': 'badge-idle',
+  'RUNNING': 'badge-running',
+  'DONE': 'badge-done',
+  'ERROR': 'badge-error'
+} %}
+<div>
+  <span class="badge {{ status_class.get(job_status, 'badge-idle') }}">{{ job_status }}</span>
+  {% if job_status == 'RUNNING' %}
+  <p class="text-muted mt-1" style="font-size:0.8rem;">Job is running… check the log panel below.</p>
+  {% elif job_status == 'DONE' %}
+  <p class="text-success mt-1" style="font-size:0.8rem;">Last job completed successfully.</p>
+  {% elif job_status == 'ERROR' %}
+  <p class="text-error mt-1" style="font-size:0.8rem;">Last job exited with an error.</p>
+  {% else %}
+  <p class="text-muted mt-1" style="font-size:0.8rem;">No job running.</p>
+  {% endif %}
+</div>

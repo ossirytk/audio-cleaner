@@ -1,0 +1,89 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Start web server (Windows)",
+      "type": "shell",
+      "command": "uv",
+      "args": [
+        "run",
+        "uvicorn",
+        "web_app:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--reload"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "pwsh.exe",
+          "args": ["-NoProfile", "-Command"]
+        }
+      },
+      "isBackground": true,
+      "problemMatcher": [
+        {
+          "owner": "custom",
+          "pattern": [
+            {
+              "regexp": "^(a^)()()$",
+              "file": 1,
+              "line": 2,
+              "message": 3
+            }
+          ],
+          "background": {
+            "activeOnStart": true,
+            "beginsPattern": ".+",
+            "endsPattern": "Application startup complete\\.|Uvicorn running on http://127\\.0\\.0\\.1:8000"
+          }
+        }
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false,
+        "clear": false
+      },
+      "detail": "Starts the FastAPI web server with hot-reload via uvicorn."
+    },
+    {
+      "label": "Stop web server (Windows)",
+      "type": "shell",
+      "command": "$processIds = @(Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique); if ($processIds.Count -eq 0) { Write-Host 'No listening web server found on port 8000.'; exit 0 }; $processIds | ForEach-Object { Stop-Process -Id $_ }; Write-Host ('Stopped web server process(es): ' + ($processIds -join ', '))",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+          "executable": "pwsh.exe",
+          "args": ["-NoProfile", "-Command"]
+        }
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false,
+        "clear": true
+      },
+      "detail": "Stops the web server by terminating whichever process is listening on port 8000."
+    },
+    {
+      "label": "Restart web server (Windows)",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Stop web server (Windows)",
+        "Start web server (Windows)"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false,
+        "clear": true
+      },
+      "detail": "Stops any existing server on port 8000, then starts a fresh one."
+    }
+  ]
+}

@@ -10,6 +10,14 @@ dependencies = []
 dev = [
     "ruff>=0.9",
 ]
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.9",
+    "loguru>=0.7.0",
+    "python-dotenv>=1.0.0",
+]
 # ML training dependencies (HDemucs-based jingle separation).
 # Install with: uv sync --extra training
 # Note: for GPU support install torch/torchaudio with the matching CUDA wheel:
@@ -94,7 +102,7 @@ select = [
     "FURB",
     "RUF",
 ]
-ignore = ["FBT001", "S603", "G004", "S607", "COM812"]
+ignore = ["FBT001", "S603", "G004", "S607", "COM812", "TC003"]
 unfixable = [
     # Don't touch unused imports
     "F401",
@@ -109,7 +117,14 @@ unfixable = [
     "PLR2004", # magic values acceptable in scripts
     "SLF001",  # _spawn is pydub's official API for frame-rate tricks
     "PLC0415", # deferred imports are intentional (demucs only available after training setup)
-    "INP001",  # scripts/ is not a package
+    "INP001",  # scripts/ is a package (has __init__.py); INP001 would be a false positive
+]
+# FastAPI idioms and web-specific patterns
+"web_app.py" = [
+    "B008",    # File(...)/Form(...) defaults are FastAPI's standard dependency injection pattern
+    "ASYNC240", # sync pathlib operations are fine in this non-trio/anyio codebase
+    "PLR0913", # FastAPI form handlers naturally have many parameters
+    "ARG001",  # lifespan(app) is required by FastAPI contract; unused request args are fine
 ]
 
 [tool.ruff.lint.flake8-tidy-imports]

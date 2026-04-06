@@ -1,0 +1,79 @@
+{% extends "layout.html" %}
+{% block title %} — Inference{% endblock %}
+{% block topbar %}Audio Separation (Inference){% endblock %}
+{% block content %}
+
+<div class="grid-2">
+
+  <!-- Upload + run -->
+  <div class="card">
+    <p class="card-title">Input</p>
+    <form hx-post="/inference/run" hx-target="#infer-status" hx-swap="innerHTML"
+          hx-encoding="multipart/form-data" hx-indicator="#infer-indicator">
+
+      <div class="form-row">
+        <label>Audio file (WAV/FLAC/MP3)</label>
+        <input type="file" name="file" accept=".wav,.flac,.mp3" required />
+      </div>
+
+      <div class="form-row">
+        <label for="checkpoint">Checkpoint</label>
+        <select id="checkpoint" name="checkpoint" disabled>
+          <option value="">— auto (latest) —</option>
+          {% for ckpt in checkpoints %}
+          <option value="{{ ckpt.xp_name }}"{% if ckpt.is_latest %} selected{% endif %}>
+            {{ ckpt.xp_name }}{% if ckpt.is_latest %} (latest){% endif %}
+          </option>
+          {% endfor %}
+        </select>
+        <p class="text-muted mt-1" style="font-size:0.8rem;">
+          Checkpoint selection is not yet supported via the web UI — the latest checkpoint is used automatically.
+        </p>
+      </div>
+
+      <div class="flex-gap">
+        <button type="submit" class="btn btn-primary">🎛️ Run separation</button>
+        <span id="infer-indicator" class="htmx-indicator text-muted" style="font-size:0.8rem;">Running…</span>
+      </div>
+    </form>
+  </div>
+
+  <!-- Status + results -->
+  <div class="card">
+    <p class="card-title">Status</p>
+    <div id="infer-status"
+         hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="innerHTML">
+      {% include "partials/job_status.html" %}
+    </div>
+
+    {% if results %}
+    <hr />
+    <p class="card-title" style="margin-top:0.5rem;">Download stems</p>
+    <ul class="file-list">
+      {% for f in results %}
+      <li>
+        <span>{{ f.name }}</span>
+        <a href="/inference/download/{{ f.name }}" class="btn btn-sm btn-success">⬇ Download</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+
+</div>
+
+<!-- Live log -->
+<div class="card">
+  <div class="flex-between" style="margin-bottom:0.5rem;">
+    <p class="card-title" style="margin:0;">Live log</p>
+    <button class="btn btn-sm" onclick="document.getElementById('infer-log').scrollTop=9999999;">↓ scroll</button>
+  </div>
+  <div id="infer-log" class="log-panel"
+       hx-ext="sse"
+       sse-connect="/api/stream-log"
+       sse-swap="message"
+       hx-swap="beforeend">
+  </div>
+</div>
+
+{% endblock %}
