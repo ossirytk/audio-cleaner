@@ -1,179 +1,233 @@
 # audio-cleaner
 
-A Python toolkit for cleaning **FLAC** and **WAV** audio files.
+Train and apply a custom **[HDemucs](https://github.com/facebookresearch/demucs)** model to
+automatically remove radio station idents, jingles, and advertisements from audio recordings.
 
-## Features
+## How it works
 
-| Feature | Module | Plan |
-|---|---|---|
-| Loudness normalisation, de-clipping, EQ, compression | `audio_cleaner.quality` | [docs/plan-audio-quality.md](docs/plan-audio-quality.md) |
-| Ad / interrupt detection and removal | `audio_cleaner.ads` | Implemented |
-| Fingerprint-based ad profile learning and application | `audio_cleaner.ads` | [docs/plan-fingerprint-cleaning.md](docs/plan-fingerprint-cleaning.md) |
+HDemucs is a **source separation** model — it learns to split a mixed audio signal into separate
+components called *stems*. This project repurposes it by training it to recognise jingles as one
+stem and background music as another.
 
-## Quick Start
+For training, the model needs paired examples of:
+- **Background music** — clean music clips without any announcements
+- **Jingle audio** — isolated recordings of just the idents or announcements you want removed
 
-```bash
-# Install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
+From these two ingredients the training pipeline synthetically creates thousands of *mixtures*
+(music with a jingle overlaid at a random position and volume), then trains the model to undo the
+mixing. Once trained, you can feed it any new recording and it will output a clean version with
+jingles removed.
 
-# Install dependencies
-uv sync
+> **Don't have isolated jingle recordings?** See
+> [Getting isolated jingle stems](#getting-isolated-jingle-stems) below.
 
-# Run the CLI
-uv run audio-cleaner --help
+## Prerequisites
+
+- Windows (primary), Linux, or macOS
+- Python 3.12
+- [uv](https://github.com/astral-sh/uv) package manager (installed in Step 1)
+- [FFmpeg](https://ffmpeg.org/) — required for audio decoding. Install via:
+  ```powershell
+  winget install --id Gyan.FFmpeg
+  ```
+- An NVIDIA GPU with at least 8 GB VRAM is strongly recommended — CPU training works but is
+  extremely slow
+
+## Data layout
+
+All data lives under a single base directory, defaulting to `I:\jingle_removal\`. You can change
+this by setting the `JINGLE_BASE_DIR` environment variable before running any command.
+```powershell
+$env:JINGLE_BASE_DIR
 ```
 
-## Ad Removal Modes
-
-The `remove-ads` command supports non-destructive replacement, optional ducking,
-and hard cuts for timestamp-marked ad intervals.
-
-```bash
-# Default timestamp behavior: replace ad intervals with smooth bridges (preserves duration)
-uv run audio-cleaner remove-ads input.wav --output cleaned/ \
-	--strategy timestamps --timestamps 30.0,45.0
-
-# Ducking mode: lower the ad interval by 24 dB
-uv run audio-cleaner remove-ads input.wav --output cleaned/ \
-	--strategy timestamps --timestamps 30.0,45.0 \
-	--timestamp-action duck --timestamp-duck-db -24
-
-# Hard removal: physically cut timestamp intervals out
-uv run audio-cleaner remove-ads input.wav --output cleaned/ \
-	--strategy timestamps --timestamps 30.0,45.0 \
-	--timestamp-action remove
-
-# Hard removal with seam-optimized defaults (recommended)
-uv run audio-cleaner remove-ads input.wav --output cleaned/ \
-	--strategy timestamps --timestamps 30.0,45.0 \
-	--timestamp-action remove --fade-ms 60 --cut-snap-ms 250 --cut-match-ms 40
-
-# Combined mode: replace timestamp intervals and remove fingerprint matches
-uv run audio-cleaner remove-ads input.wav --output cleaned/ \
-	--strategy combined --timestamps 30.0,45.0 \
-	--reference-clips known_ad.wav
+```
+I:\jingle_removal\
+├── music_sources\             # Raw music files (FLAC) used as background content
+├── music_sources_cassettes\   # Optional second folder of raw music files
+├── music_clips\               # 40-second WAV clips prepared from the sources above
+├── jingles_original\          # Raw jingle / ident recordings (unprocessed)
+├── jingles_processed\         # Normalised versions of the same jingles
+├── training_dataset\          # Assembled training data (created automatically)
+│   ├── train\<track>\         # drums.wav  bass.wav  other.wav  vocals.wav  mixture.wav
+│   └── valid\<track>\         # same structure, used for validation during training
+├── outputs\                   # Model checkpoints saved during training
+├── test_audio\mixture.wav     # A recording you want to clean (used in Step 6)
+└── separation_results\        # Cleaned audio output from Step 6
 ```
 
-## Fingerprint-Based Ad Profile
+## Step-by-step workflow
 
-Use the **profile workflow** when ad breaks are structurally repeated and you have
-rough timestamps from at least one source recording.  The workflow has two steps:
+### Step 1 — Install dependencies
 
-### Step 1 — learn a profile
+```powershell
+# Install uv (skip if already installed)
+powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-```bash
-# Learn from four known ad break positions in a source FLAC file.
-# Produces ad_profile.json + ad_profile.npz.
-uv run audio-cleaner learn-ads \
-    --input source.flac \
-    --timestamps 102,106 181,185 438,442 532,536 \
-    --profile-out ad_profile
-
-# Optional: downsample to 16 kHz to speed up matching on long files
-uv run audio-cleaner learn-ads \
-    --input source.flac \
-    --timestamps 102,106 181,185 438,442 532,536 \
-    --profile-out ad_profile \
-    --resample-hz 16000
+# Install all project dependencies and apply the required patches
+uv sync --extra dev --extra training
+uv run python scripts/apply_patches.py
 ```
 
-### Step 2 — apply the profile
+**For GPU-accelerated training** (strongly recommended), replace the default CPU version of
+PyTorch, then re-apply the patches:
 
-```bash
-# Remove detected ad breaks from a single file (hard cut with crossfade)
-uv run audio-cleaner apply-ads-profile \
-    --input new_episode.flac \
-    --profile ad_profile \
-    --output cleaned/ \
-    --action remove
-
-# Apply to an entire directory of FLAC/WAV files
-uv run audio-cleaner apply-ads-profile \
-    --input recordings/ \
-    --profile ad_profile \
-    --output cleaned/ \
-    --action remove
-
-# Duck (attenuate) rather than cut
-uv run audio-cleaner apply-ads-profile \
-    --input new_episode.wav \
-    --profile ad_profile \
-    --output cleaned/ \
-    --action duck --duck-db -24
+```powershell
+uv pip install torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu126
+uv run python scripts/apply_patches.py
 ```
 
-### Profile format
+> Re-run `uv run python scripts/apply_patches.py` any time you run `uv sync`, as syncing can
+> overwrite the patched files.
 
-Two files are written side-by-side:
+### Step 2 — Prepare music clips
 
-| File | Contents |
-|---|---|
-| `<base>.json` | Human-readable metadata (version, sample rate, per-fingerprint thresholds) |
-| `<base>.npz` | Compact numpy arrays (time-domain templates + spectral signatures) |
+Place your source music files (FLAC format) into `I:\jingle_removal\music_sources\`, then run:
 
-```json
-{
-  "profile_version": 1,
-  "sample_rate": 44100,
-  "created_from": "source.flac",
-  "fingerprints": [
-    {
-      "id": "ad_01",
-      "duration_s": 4.02,
-      "ncc_threshold": 0.72,
-      "spec_threshold": 0.65,
-      "confidence": 1.0
-    }
-  ],
-  "refinement": { "snap_ms": 250.0, "match_ms": 40.0 }
-}
+```powershell
+uv run python -m scripts.create_samples
 ```
 
-### Python API
+This slices each file into a random 40-second clip, resamples to 44.1 kHz stereo, normalises
+the level, and saves the result to `music_clips\`.
 
-```python
-import soundfile as sf
-from audio_cleaner.ads import create_ad_profile, save_ad_profile
-from audio_cleaner.ads import load_ad_profile, clean_with_profile
+> **Already done?** If you already have 40-second WAV clips ready, place them directly in
+> `music_clips\` and skip this step.
 
-# Learn
-audio, sr = sf.read("source.flac", dtype="float32")
-profile = create_ad_profile(
-    audio, sr,
-    rough_timestamps=[(102.0, 106.0), (181.0, 185.0), (438.0, 442.0), (532.0, 536.0)],
-    created_from="source.flac",
-)
-save_ad_profile(profile, "ad_profile")
+### Step 3 — Prepare isolated jingle audio
 
-# Apply
-profile = load_ad_profile("ad_profile")
-audio, sr = sf.read("new_episode.flac", dtype="float32")
-cleaned = clean_with_profile(audio, sr, profile, action="remove")
-sf.write("new_episode_cleaned.flac", cleaned, sr)
+You need recordings of just the jingle or announcement on its own — without music playing
+underneath. See [Getting isolated jingle stems](#getting-isolated-jingle-stems) if you only have
+a mixed broadcast recording.
+
+Once you have isolated jingle files:
+
+- Copy them to `jingles_original\` (raw, unprocessed versions)
+- Copy them to `jingles_processed\` (or a normalised/cleaned-up version if you have one)
+
+Using the same files in both folders is fine as a starting point.
+
+### Step 4 — Build the training dataset
+
+```powershell
+uv run python -m scripts.generate_dataset
 ```
 
-## Toolchain
+This mixes the jingles into the music clips at random positions and volumes, producing the
+`training_dataset\` folder with train and validation splits.
 
-- **[uv](https://github.com/astral-sh/uv)** — fast package & virtual-env manager
-- **[ruff](https://docs.astral.sh/ruff/)** — linter + formatter
-- **[pyrefly](https://pyrefly.org/)** — static type checker
-- **[pytest](https://pytest.org/)** — test framework
+### Step 5 — Train the model
+
+Before training, install the CUDA-enabled version of PyTorch for GPU acceleration
+(replace `cu126` with your CUDA version if different):
+
+```powershell
+uv pip install torch==2.8.0+cu126 torchaudio==2.8.0+cu126 `
+    --extra-index-url https://download.pytorch.org/whl/cu126
+```
+
+Then start training:
+
+```powershell
+uv run dora --package demucs run model=hdemucs dset=musdb44 `
+    epochs=200 `
+    ++batch_size=2 `
+    ++misc.num_workers=0 `
+    ++optim.lr=0.0002 `
+    "++weights=[0.1,0.1,1.0,5.0]" `
+    ++augment.remix.group_size=2 `
+    +name=HIFI_HDEMUCS `
+    ++test.every=999 `
+    ++dset.use_musdb=false `
+    dset.wav=D:\data\training_dataset
+```
+
+Training progress is printed to the console. Checkpoints are saved to `outputs\`. Expect this to
+take several hours on a GPU depending on dataset size.
+
+> **Note on `++test.every=999`:** the test evaluation step requires the official musdb
+> benchmark dataset, which we don't use. Setting this to a value larger than `epochs`
+> disables it. Validation (loss on your own held-out clip) still runs every epoch.
+
+**Resuming a stopped run:** at the start of training, a short signature code is printed (e.g.
+`f88645aa`). Pass it to resume from the last checkpoint by appending `continue_from=<code>`:
+
+```powershell
+uv run dora --package demucs run model=hdemucs dset=musdb44 `
+    epochs=200 `
+    ++batch_size=2 `
+    ++misc.num_workers=0 `
+    ++optim.lr=0.0002 `
+    "++weights=[0.1,0.1,1.0,5.0]" `
+    ++augment.remix.group_size=2 `
+    +name=HIFI_HDEMUCS `
+    ++test.every=999 `
+    ++dset.use_musdb=false `
+    dset.wav=D:\data\training_dataset `
+    continue_from=f88645aa
+```
+
+### Step 6 — Clean a recording
+
+Place the audio file you want to clean at `I:\jingle_removal\test_audio\mixture.wav`, then run:
+
+```powershell
+uv run python -m scripts.separate_audio
+```
+
+Results are saved to `separation_results\`. The file you want is **`result_other.wav`** — the
+background music with jingles removed. `result_vocals.wav` contains the isolated jingle audio if
+you want to inspect what was removed.
+
+---
+
+## Getting isolated jingle stems
+
+The training pipeline requires isolated jingle audio — just the announcement sound on its own,
+without background music underneath. If you only have a broadcast recording where the jingle is
+mixed into music, you need to extract it first. There are three approaches:
+
+### Option A — Use a pre-trained separation model (recommended starting point)
+
+Run your broadcast recording through the stock HDemucs model to get a rough vocal/speech stem:
+
+```powershell
+uv run python -m demucs.separate --name htdemucs "I:\path\to\your\broadcast.wav"
+```
+
+Output is saved to a `separated\htdemucs\` folder next to the input file. The `vocals.wav` stem
+will contain most of the speech and announcements. The separation will not be perfect, but you
+can manually clean it up in an audio editor.
+
+### Option B — Manual editing
+
+Open your broadcast recording in **[Audacity](https://www.audacityteam.org/)** (free) or a DAW
+such as Reaper. Find moments where only the announcement plays — for example, over a pause or a
+fade — and export those segments as a new file. Even a few seconds of clean announcement audio
+is usable.
+
+### Option C — Find or re-record the original jingle
+
+Radio station idents are often professionally produced audio packages. Check whether the station
+publishes them, or see if a clean version is available elsewhere. This gives the highest-quality
+stems and the best training results.
+
+---
+
+## Patches
+
+`patches/` contains small fixes to the upstream `demucs` package that are required for this
+project to work correctly on Windows. They are applied automatically as part of Step 1 above
+(`uv run python scripts/apply_patches.py`).
+
+See [`patches/README.md`](patches/README.md) for the full change list.
 
 ## Development
 
-```bash
-# Install with dev extras
-uv sync --extra dev
-
-# Lint + format
-ruff check src tests
-ruff format src tests
-
-# Type check
-pyrefly check src
-
-# Tests
-uv run pytest
+```powershell
+uv run ruff check scripts patches           # check code style
+uv run ruff check --fix scripts patches     # auto-fix style issues
+uv run ruff format scripts patches          # format files
 ```
 
 See [AGENTS.md](AGENTS.md) for AI coding-agent guidelines.
