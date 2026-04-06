@@ -124,7 +124,7 @@ class JobRunner:
             self._new_line.clear()
             # threading.Event.wait() is a blocking function — safe to run in
             # executor.  Pass a timeout so we re-check status if no line arrives.
-            await loop.run_in_executor(None, lambda: self._new_line.wait(1.0))
+            await loop.run_in_executor(None, self._new_line.wait, 1.0)
 
     # ------------------------------------------------------------------
     # Internal
