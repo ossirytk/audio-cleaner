@@ -117,7 +117,7 @@ unfixable = [
     "PLR2004", # magic values acceptable in scripts
     "SLF001",  # _spawn is pydub's official API for frame-rate tricks
     "PLC0415", # deferred imports are intentional (demucs only available after training setup)
-    "INP001",  # scripts/ is not a package
+    "INP001",  # scripts/ is a package (has __init__.py); INP001 would be a false positive
 ]
 # FastAPI idioms and web-specific patterns
 "web_app.py" = [

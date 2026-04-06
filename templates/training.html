@@ -8,7 +8,7 @@
   <!-- Config form -->
   <div class="card">
     <p class="card-title">Hyperparameters</p>
-    <form id="train-form" hx-post="/training/start" hx-target="#train-status" hx-swap="outerHTML">
+    <form id="train-form" hx-post="/training/start" hx-target="#train-status" hx-swap="innerHTML">
       <div class="form-grid">
         <div class="form-row">
           <label for="epochs">Epochs</label>
@@ -42,7 +42,7 @@
       <div class="flex-gap mt-1">
         <button type="submit" class="btn btn-primary" id="btn-start">▶ Start training</button>
         <button type="button" class="btn btn-danger"
-          hx-post="/training/stop" hx-target="#train-status" hx-swap="outerHTML">
+          hx-post="/training/stop" hx-target="#train-status" hx-swap="innerHTML">
           ■ Stop
         </button>
       </div>
@@ -53,7 +53,7 @@
   <div class="card">
     <p class="card-title">Status</p>
     <div id="train-status"
-         hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="outerHTML">
+         hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="innerHTML">
       {% include "partials/job_status.html" %}
     </div>
     <hr />

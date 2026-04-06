@@ -8,7 +8,7 @@
   <!-- Upload + run -->
   <div class="card">
     <p class="card-title">Input</p>
-    <form hx-post="/inference/run" hx-target="#infer-status" hx-swap="outerHTML"
+    <form hx-post="/inference/run" hx-target="#infer-status" hx-swap="innerHTML"
           hx-encoding="multipart/form-data" hx-indicator="#infer-indicator">
 
       <div class="form-row">
@@ -18,7 +18,7 @@
 
       <div class="form-row">
         <label for="checkpoint">Checkpoint</label>
-        <select id="checkpoint" name="checkpoint">
+        <select id="checkpoint" name="checkpoint" disabled>
           <option value="">— auto (latest) —</option>
           {% for ckpt in checkpoints %}
           <option value="{{ ckpt.xp_name }}"{% if ckpt.is_latest %} selected{% endif %}>
@@ -26,12 +26,12 @@
           </option>
           {% endfor %}
         </select>
-        {% if not checkpoints %}
         <p class="text-muted mt-1" style="font-size:0.8rem;">
-          No checkpoints found — run training first or add a <code>checkpoint.th</code> to <code>outputs/xps/</code>.
+          Checkpoint selection is not yet supported via the web UI — the latest checkpoint is used automatically.
         </p>
-        {% endif %}
       </div>
+
+      <input type="hidden" name="checkpoint" value="" />
 
       <div class="flex-gap">
         <button type="submit" class="btn btn-primary">🎛️ Run separation</button>
@@ -44,7 +44,7 @@
   <div class="card">
     <p class="card-title">Status</p>
     <div id="infer-status"
-         hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="outerHTML">
+         hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="innerHTML">
       {% include "partials/job_status.html" %}
     </div>
 

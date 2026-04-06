@@ -30,7 +30,7 @@
 
   <div class="card">
     <p class="card-title">Job Status</p>
-    <div id="job-status-box" hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="outerHTML">
+    <div id="job-status-box" hx-get="/api/job-status" hx-trigger="every 3s" hx-swap="innerHTML">
       {% include "partials/job_status.html" %}
     </div>
   </div>

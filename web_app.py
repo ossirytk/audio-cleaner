@@ -55,6 +55,8 @@ from scripts.config import (  # noqa: E402
 # Startup
 # ---------------------------------------------------------------------------
 
+_PROJECT_ROOT = Path(__file__).parent
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -67,12 +69,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="audio-cleaner", lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory=_PROJECT_ROOT / "templates")
 
 # Single shared job runner — one job at a time across the whole app.
 _runner = JobRunner()
-
-_PROJECT_ROOT = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -177,6 +177,8 @@ async def _save_audio_upload(
     list_id: str,
     list_fn: object,
 ) -> HTMLResponse:
+    if not _base_dir_ok():
+        return _not_configured_response(request)
     if not upload.filename or not _assert_audio(upload.filename):
         return HTMLResponse(
             f'<div id="{list_id}"><p class="text-error">Unsupported file type.</p></div>',
@@ -184,9 +186,16 @@ async def _save_audio_upload(
         )
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / Path(upload.filename).name
-    content = await upload.read()
-    dest.write_bytes(content)
-    logger.info("Uploaded {} ({} bytes) → {}", upload.filename, len(content), dest)
+    bytes_written = 0
+    chunk_size = 1024 * 1024
+    try:
+        with dest.open("wb") as f:
+            while chunk := await upload.read(chunk_size):
+                f.write(chunk)
+                bytes_written += len(chunk)
+    finally:
+        await upload.close()
+    logger.info("Uploaded {} ({} bytes) → {}", upload.filename, bytes_written, dest)
     files = list_fn()  # type: ignore[call-arg]
     return templates.TemplateResponse(
         request,
@@ -201,8 +210,10 @@ async def _save_audio_upload(
 
 
 @app.post("/pipeline/create-samples", response_class=HTMLResponse)
-async def pipeline_create_samples() -> HTMLResponse:
+async def pipeline_create_samples(request: Request) -> HTMLResponse:
     """Kick off create_samples.py in the background."""
+    if not _base_dir_ok():
+        return _not_configured_response(request)
     cmd = [*_uv_cmd(), "run", "python", "-m", "scripts.create_samples"]
     started = _runner.start(cmd, cwd=_PROJECT_ROOT)
     if not started:
@@ -211,8 +222,10 @@ async def pipeline_create_samples() -> HTMLResponse:
 
 
 @app.post("/pipeline/generate-dataset", response_class=HTMLResponse)
-async def pipeline_generate_dataset() -> HTMLResponse:
+async def pipeline_generate_dataset(request: Request) -> HTMLResponse:
     """Kick off generate_dataset.py in the background."""
+    if not _base_dir_ok():
+        return _not_configured_response(request)
     cmd = [*_uv_cmd(), "run", "python", "-m", "scripts.generate_dataset"]
     started = _runner.start(cmd, cwd=_PROJECT_ROOT)
     if not started:
@@ -264,16 +277,23 @@ async def training_start(
     name: str = Form(""),
 ) -> HTMLResponse:
     """Start a training run with the given hyperparameters."""
+    if not _base_dir_ok():
+        return _not_configured_response(request)
     weights_arg = f"[{weights}]"
     cmd = [
-        *_uv_cmd(), "run", "dora", "--package", "demucs", "run",
+        *_uv_cmd(),
+        "run",
+        "dora",
+        "--package",
+        "demucs",
+        "run",
         "model=hdemucs",
         "dset=musdb44",
         f"epochs={epochs}",
         f"++batch_size={batch_size}",
         "++misc.num_workers=0",
         f"++optim.lr={lr}",
-        f'"++weights={weights_arg}"',
+        f"++weights={weights_arg}",
         f"++augment.remix.group_size={group_size}",
         "++augment.repitch.proba=0",
         f"++test.every={test_every}",
@@ -339,21 +359,33 @@ async def inference_run(
     checkpoint: str = Form(""),
 ) -> HTMLResponse:
     """Upload audio and start a separation job."""
+    if not _base_dir_ok():
+        return _not_configured_response(request)
     if not file.filename or not _assert_audio(file.filename):
         return HTMLResponse('<p class="text-error">Unsupported file type.</p>', status_code=400)
 
-    # Save uploaded file as the inference input
-    INFERENCE_INPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    content = await file.read()
-    INFERENCE_INPUT_FILE.write_bytes(content)
-    logger.info("Inference input saved: {} ({} bytes)", INFERENCE_INPUT_FILE, len(content))
-
-    env = {**os.environ}
-    cmd_parts = [*_uv_cmd(), "run", "python", "-m", "scripts.separate_audio"]
     if checkpoint:
-        env["DEMUCS_MODEL_FOLDER"] = checkpoint
+        return HTMLResponse(
+            '<p class="text-error">Checkpoint selection is not currently supported for web inference. '
+            "Use the default (auto latest) or configure the model folder directly.</p>",
+            status_code=400,
+        )
 
-    started = _runner.start(cmd_parts, cwd=_PROJECT_ROOT, env=env)
+    # Save uploaded file as the inference input using chunked writes.
+    INFERENCE_INPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    bytes_written = 0
+    chunk_size = 1024 * 1024
+    try:
+        with INFERENCE_INPUT_FILE.open("wb") as f:
+            while chunk := await file.read(chunk_size):
+                f.write(chunk)
+                bytes_written += len(chunk)
+    finally:
+        await file.close()
+    logger.info("Inference input saved: {} ({} bytes)", INFERENCE_INPUT_FILE, bytes_written)
+
+    cmd_parts = [*_uv_cmd(), "run", "python", "-m", "scripts.separate_audio"]
+    started = _runner.start(cmd_parts, cwd=_PROJECT_ROOT)
     if not started:
         return templates.TemplateResponse(
             request,
@@ -392,13 +424,13 @@ async def settings_page(request: Request) -> HTMLResponse:
             "active_page": "settings",
             "base_dir": str(BASE_DIR),
             "paths": {
-                "music_clips":        str(INPUT_MUSIC_DIR),
-                "jingles_original":   str(ORIGINAL_JINGLES_DIR),
-                "jingles_processed":  str(PROCESSED_JINGLES_DIR),
-                "training_dataset":   str(OUTPUT_DATASET_DIR),
-                "test_audio":         str(INFERENCE_INPUT_FILE.parent),
-                "inference_results":  str(INFERENCE_OUTPUT_DIR),
-                "checkpoints":        str(MODEL_OUTPUTS_DIR),
+                "music_clips": str(INPUT_MUSIC_DIR),
+                "jingles_original": str(ORIGINAL_JINGLES_DIR),
+                "jingles_processed": str(PROCESSED_JINGLES_DIR),
+                "training_dataset": str(OUTPUT_DATASET_DIR),
+                "test_audio": str(INFERENCE_INPUT_FILE.parent),
+                "inference_results": str(INFERENCE_OUTPUT_DIR),
+                "checkpoints": str(MODEL_OUTPUTS_DIR),
             },
         },
     )
@@ -408,9 +440,16 @@ async def settings_page(request: Request) -> HTMLResponse:
 async def settings_save(base_dir: str = Form(...)) -> HTMLResponse:
     """Persist JINGLE_BASE_DIR to .env.
 
-    With ``uvicorn --reload`` the server reloads automatically when .env changes.
-    Without --reload the user must restart the server manually.
+    With ``uvicorn --reload`` the server reloads automatically when a watched
+    Python file changes.  Without --reload the user must restart the server
+    manually after saving settings.
     """
+    # Reject values containing newlines or null bytes to prevent env-file injection.
+    if any(c in base_dir for c in ("\n", "\r", "\x00")):
+        return HTMLResponse(
+            '<div id="settings-msg"><p class="text-error">Invalid path: must be a single line.</p></div>',
+            status_code=400,
+        )
     env_file = _PROJECT_ROOT / ".env"
     lines: list[str] = []
     if env_file.exists():
@@ -420,15 +459,12 @@ async def settings_save(base_dir: str = Form(...)) -> HTMLResponse:
     os.environ["JINGLE_BASE_DIR"] = base_dir
     logger.info("JINGLE_BASE_DIR saved: {}", base_dir)
 
-    # Touch web_app.py so uvicorn --reload picks up the change immediately.
-    _PROJECT_ROOT.joinpath("web_app.py").touch()
-
     return HTMLResponse(
         '<div id="settings-msg">'
-        '<p class="text-success mt-1">✓ Saved. Server is reloading…</p>'
+        '<p class="text-success mt-1">✓ Saved. Restart the server to apply the new path.</p>'
         '<p class="text-muted mt-1" style="font-size:0.8rem;">'
-        "Page will refresh in a moment — or reload manually if nothing happens.</p>"
-        '<script>setTimeout(() => location.href = "/", 2000);</script>'
+        "If running with <code>--reload</code>, touching a Python file will trigger a reload. "
+        "Otherwise restart <code>uvicorn</code> manually.</p>"
         "</div>"
     )
 
@@ -446,17 +482,26 @@ async def stream_log() -> StreamingResponse:
     When no job is running it sends a keepalive comment every 15 seconds.
     When a job starts it streams lines in real time; after the job ends it
     continues waiting for the next job.
+
+    Uses a monotonic ``total_appended`` cursor so that lines are never missed
+    even when the internal deque evicts old entries after 2000 lines.
     """
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        yielded = 0
+        # cursor tracks the total number of lines appended across the lifetime
+        # of the current job (resets when a new job starts via runner.start()).
+        cursor = 0
         while True:
-            snapshot = _runner.get_log()
-            while yielded < len(snapshot):
-                line = snapshot[yielded]
-                safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                yield f"data: <span>{safe}</span>\n\n"
-                yielded += 1
+            snapshot, total = _runner.get_log_cursor()
+            if total > cursor:
+                # Determine how many new lines to emit, capped by buffer size.
+                new_count = total - cursor
+                available = snapshot  # list from get_log_cursor
+                new_lines = available[max(0, len(available) - new_count) :]
+                for line in new_lines:
+                    safe = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    yield f"data: <span>{safe}</span>\n\n"
+                cursor = total
 
             if _runner.is_running:
                 # Job in progress — tight poll to stream output quickly.

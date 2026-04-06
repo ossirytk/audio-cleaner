@@ -14,7 +14,6 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import subprocess
 import threading
 from collections import deque
@@ -44,9 +43,10 @@ class JobRunner:
         self._lock = threading.Lock()
         self._status: JobStatus = JobStatus.IDLE
         self._log: deque[str] = deque(maxlen=_LOG_BUFFER_SIZE)
+        self._total_appended: int = 0  # monotonic counter; never decrements
         self._process: subprocess.Popen | None = None  # type: ignore[type-arg]
-        self._new_line = asyncio.Event()
-        self._loop: asyncio.AbstractEventLoop | None = None
+        # threading.Event is thread-safe and can be waited on in run_in_executor.
+        self._new_line = threading.Event()
 
     # ------------------------------------------------------------------
     # Public API
@@ -71,8 +71,8 @@ class JobRunner:
             if self._status is JobStatus.RUNNING:
                 return False
             self._log.clear()
+            self._total_appended = 0
             self._status = JobStatus.RUNNING
-            self._loop = asyncio.get_event_loop()
 
         thread = threading.Thread(target=self._run, args=(cmd, cwd, env), daemon=True)
         thread.start()
@@ -91,6 +91,17 @@ class JobRunner:
         """Return the full buffered log as a list of lines."""
         return list(self._log)
 
+    def get_log_cursor(self) -> tuple[list[str], int]:
+        """Return ``(log_snapshot, total_appended)`` for cursor-based SSE streaming.
+
+        ``total_appended`` is a monotonically increasing counter that is never
+        reset (even when the deque evicts old lines), so consumers can detect
+        how many new lines have arrived since their last poll regardless of
+        eviction.
+        """
+        with self._lock:
+            return list(self._log), self._total_appended
+
     async def stream_log(self, from_line: int = 0) -> AsyncGenerator[str, None]:
         """Async generator that yields log lines as they arrive.
 
@@ -98,6 +109,7 @@ class JobRunner:
         waits for new lines until the job finishes.
         """
         yielded = from_line
+        loop = asyncio.get_event_loop()
         while True:
             snapshot = list(self._log)
             while yielded < len(snapshot):
@@ -107,14 +119,12 @@ class JobRunner:
             if self._status is not JobStatus.RUNNING:
                 break
 
-            # Wait for the background thread to signal a new line (with timeout
-            # so we don't stall if the event is never set after job ends).
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.shield(asyncio.get_event_loop().run_in_executor(None, self._new_line.wait)),
-                    timeout=1.0,
-                )
+            # Clear before waiting to avoid missing a signal that arrives
+            # between the snapshot check and this point; re-check log above.
             self._new_line.clear()
+            # threading.Event.wait() is a blocking function — safe to run in
+            # executor.  Pass a timeout so we re-check status if no line arrives.
+            await loop.run_in_executor(None, lambda: self._new_line.wait(1.0))
 
     # ------------------------------------------------------------------
     # Internal
@@ -134,19 +144,23 @@ class JobRunner:
             assert self._process.stdout is not None  # noqa: S101
             for raw in self._process.stdout:
                 line = raw.rstrip("\n")
-                self._log.append(line)
+                with self._lock:
+                    self._log.append(line)
+                    self._total_appended += 1
                 self._new_line.set()
 
             self._process.wait()
             rc = self._process.returncode
             with self._lock:
                 self._status = JobStatus.DONE if rc == 0 else JobStatus.ERROR
-            self._log.append(f"[exit code {rc}]")
+                self._log.append(f"[exit code {rc}]")
+                self._total_appended += 1
             self._new_line.set()
             logger.info("Job finished with exit code {}.", rc)
         except Exception as exc:
             logger.exception("Job runner error: {}", exc)
             with self._lock:
                 self._status = JobStatus.ERROR
-            self._log.append(f"[runner error: {exc}]")
+                self._log.append(f"[runner error: {exc}]")
+                self._total_appended += 1
             self._new_line.set()

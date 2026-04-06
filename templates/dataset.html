@@ -4,20 +4,20 @@
 {% block content %}
 
 <script>
-  function showTab(id) {
+  function showTab(id, button) {
     document.querySelectorAll('.tab-pane').forEach(el => el.style.display = 'none');
     document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
     document.getElementById(id).style.display = 'block';
-    event.currentTarget.classList.add('active');
+    button.classList.add('active');
   }
 </script>
 
 <div class="tabs">
-  <button class="tab-btn active" onclick="showTab('tab-music')">🎵 Music clips</button>
-  <button class="tab-btn" onclick="showTab('tab-jingles')">🔔 Jingles (raw)</button>
-  <button class="tab-btn" onclick="showTab('tab-jingles-proc')">✅ Jingles (processed)</button>
-  <button class="tab-btn" onclick="showTab('tab-tracks')">🗂️ Dataset tracks</button>
-  <button class="tab-btn" onclick="showTab('tab-pipeline')">⚙️ Run pipeline</button>
+  <button class="tab-btn active" onclick="showTab('tab-music', this)">🎵 Music clips</button>
+  <button class="tab-btn" onclick="showTab('tab-jingles', this)">🔔 Jingles (raw)</button>
+  <button class="tab-btn" onclick="showTab('tab-jingles-proc', this)">✅ Jingles (processed)</button>
+  <button class="tab-btn" onclick="showTab('tab-tracks', this)">🗂️ Dataset tracks</button>
+  <button class="tab-btn" onclick="showTab('tab-pipeline', this)">⚙️ Run pipeline</button>
 </div>
 
 <!-- Music clips -->
